@@ -430,7 +430,7 @@ async def benchmark(
         output.send_time = send_time
 
     # Process the data after the num_warmup_requests only.
-    if num_warmup_requests < len(outputs):
+    if num_warmup_requests > 0:
         outputs = outputs[num_warmup_requests:]
         input_requests = input_requests[num_warmup_requests:]
         benchmark_duration = time.perf_counter() - outputs[0].send_time
