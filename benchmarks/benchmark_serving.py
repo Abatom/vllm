@@ -176,6 +176,10 @@ def calculate_metrics(
     if num_warmup_requests > 0:
         outputs = outputs[num_warmup_requests:]
         input_requests = input_requests[num_warmup_requests:]
+        # Calculate actual benchmark duration by finding time between first and last measured request
+        first_request_time = outputs[0].start_time
+        last_request_time = outputs[-1].end_time
+        dur_s = last_request_time - first_request_time
 
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -792,12 +796,8 @@ def main(args: argparse.Namespace):
         num_warmup_requests = int(args.max_concurrency * args.warmup_ratio)
         # Ensure warmup requests don't exceed total requests
         if num_warmup_requests >= args.num_prompts:
-            warnings.warn(
-                f"Warmup requests ({num_warmup_requests}) is greater than or equal to "
-                f"total requests ({args.num_prompts}). No requests will be measured.",
-                stacklevel=2,
-            )
-            num_warmup_requests = max(0, args.num_prompts - 1)
+            print("Warning: Skipping warmup as it would leave no requests to measure")
+            num_warmup_requests = 0
 
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()
