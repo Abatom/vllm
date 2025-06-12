@@ -376,9 +376,7 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    request_send_times = []
     async for request in get_request(input_requests, request_rate, burstiness):
-        request_send_times.append(time.perf_counter())
         prompt, prompt_len, output_len, mm_content = (
             request.prompt,
             request.prompt_len,
@@ -408,9 +406,6 @@ async def benchmark(
             )
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
-
-    for output, send_time in zip(outputs, request_send_times):
-        output.send_time = send_time
 
     # Process the data after the num_warmup_requests only.
     if num_warmup_requests > 0:
