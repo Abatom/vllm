@@ -171,15 +171,6 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
-    
-    # Process the data after the num_warmup_requests only.
-    if num_warmup_requests > 0:
-        outputs = outputs[num_warmup_requests:]
-        input_requests = input_requests[num_warmup_requests:]
-        # Calculate actual benchmark duration by finding time between first and last measured request
-        first_request_time = outputs[0].start_time
-        last_request_time = outputs[-1].end_time
-        dur_s = last_request_time - first_request_time
 
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -385,7 +376,9 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    request_send_times = []
     async for request in get_request(input_requests, request_rate, burstiness):
+        request_send_times.append(time.perf_counter())
         prompt, prompt_len, output_len, mm_content = (
             request.prompt,
             request.prompt_len,
@@ -433,7 +426,16 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    for output, send_time in zip(outputs, request_send_times):
+        output.send_time = send_time
+
+    # Process the data after the num_warmup_requests only.
+    if num_warmup_requests < len(outputs):
+        outputs = outputs[num_warmup_requests:]
+        input_requests = input_requests[num_warmup_requests:]
+        benchmark_duration = time.perf_counter() - outputs[0].send_time
+    else:
+        benchmark_duration = time.perf_counter() - benchmark_start_time
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,

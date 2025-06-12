@@ -40,6 +40,7 @@ class RequestFuncInput:
 class RequestFuncOutput:
     generated_text: str = ""
     success: bool = False
+    send_time: float = 0.0
     latency: float = 0.0
     output_tokens: int = 0
     ttft: float = 0.0  # Time to first token
