@@ -160,6 +160,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    num_warmup_requests: int = 0,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -170,6 +171,12 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    
+    # Process the data after the num_warmup_requests only.
+    if num_warmup_requests > 0:
+        outputs = outputs[num_warmup_requests:]
+        input_requests = input_requests[num_warmup_requests:]
+
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -290,6 +297,7 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    num_warmup_requests: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -431,6 +439,7 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
+        num_warmup_requests=num_warmup_requests,
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -777,6 +786,19 @@ def main(args: argparse.Namespace):
         # Disable prompt caching in llama.cpp backend
         sampling_params["cache_prompt"] = False
 
+    # Calculate number of warmup requests
+    num_warmup_requests = 0
+    if args.max_concurrency is not None:
+        num_warmup_requests = int(args.max_concurrency * args.warmup_ratio)
+        # Ensure warmup requests don't exceed total requests
+        if num_warmup_requests >= args.num_prompts:
+            warnings.warn(
+                f"Warmup requests ({num_warmup_requests}) is greater than or equal to "
+                f"total requests ({args.num_prompts}). No requests will be measured.",
+                stacklevel=2,
+            )
+            num_warmup_requests = max(0, args.num_prompts - 1)
+
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()
     gc.freeze()
@@ -802,6 +824,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            num_warmup_requests=num_warmup_requests,
         )
     )
 
@@ -926,6 +949,16 @@ if __name__ == "__main__":
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.",
+    )
+
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=2.0,
+        help="Ratio of warmup requests to max-concurrency. "
+        "When --max-concurrency is set, this many times "
+        "the max-concurrency requests will be discarded "
+        "from statistics. Default is 2.0 (discard 2x max-concurrency requests).",
     )
 
     parser.add_argument(
