@@ -409,6 +409,17 @@ async def benchmark(
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
+    for output, send_time in zip(outputs, request_send_times):
+        output.send_time = send_time
+
+    # Process the data after the num_warmup_requests only.
+    if num_warmup_requests > 0:
+        outputs = outputs[num_warmup_requests:]
+        input_requests = input_requests[num_warmup_requests:]
+        benchmark_duration = time.perf_counter() - outputs[0].send_time
+    else:
+        benchmark_duration = time.perf_counter() - benchmark_start_time
+
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
@@ -425,17 +436,6 @@ async def benchmark(
 
     if pbar is not None:
         pbar.close()
-
-    for output, send_time in zip(outputs, request_send_times):
-        output.send_time = send_time
-
-    # Process the data after the num_warmup_requests only.
-    if num_warmup_requests > 0:
-        outputs = outputs[num_warmup_requests:]
-        input_requests = input_requests[num_warmup_requests:]
-        benchmark_duration = time.perf_counter() - outputs[0].send_time
-    else:
-        benchmark_duration = time.perf_counter() - benchmark_start_time
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
