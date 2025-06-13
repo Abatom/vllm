@@ -414,8 +414,9 @@ async def benchmark(
         input_requests = input_requests[num_trim_head_requests:]
         benchmark_duration = now - outputs[0].send_time
     if num_trim_tail_requests > 0:
-        outputs = outputs[:num_trim_tail_requests]
-        input_requests = input_requests[:num_trim_tail_requests]
+        total_num = len(outputs)
+        outputs = outputs[:total_num - num_trim_tail_requests]
+        input_requests = input_requests[:total_num - num_trim_tail_requests]
         benchmark_duration -= (now - outputs[-1].send_time - outputs[-1].latency)
 
     if profile:
