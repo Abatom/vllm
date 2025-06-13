@@ -793,9 +793,9 @@ def main(args: argparse.Namespace):
     num_trim_head_requests = 0
     num_trim_tail_requests = 0
     if args.max_concurrency is not None:
-        num_warmup_requests = int(args.max_concurrency * args.warmup_ratio)
         num_trim_head_requests = int(args.max_concurrency * args.trim_head_ratio)
         num_trim_tail_requests = int(args.max_concurrency * args.trim_tail_ratio)
+        print(f"Trim head requests: {num_trim_head_requests}, Trim tail requests: {num_trim_tail_requests}")
         if num_trim_head_requests + num_trim_tail_requests >= args.num_prompts:
             print("Warning: Skipping trim requests as it would leave no requests to measure")
             num_trim_head_requests = 0
