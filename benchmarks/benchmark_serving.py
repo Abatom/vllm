@@ -170,7 +170,6 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
-
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
