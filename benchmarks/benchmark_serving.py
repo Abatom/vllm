@@ -160,7 +160,6 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-    num_warmup_requests: int = 0,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -292,7 +291,8 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
-    num_warmup_requests: int = 0,
+    num_trim_head_requests: int = 0,
+    num_trim_tail_requests: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -407,13 +407,17 @@ async def benchmark(
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
-    # Process the data after the num_warmup_requests only.
-    if num_warmup_requests > 0:
-        outputs = outputs[num_warmup_requests:]
-        input_requests = input_requests[num_warmup_requests:]
-        benchmark_duration = time.perf_counter() - outputs[0].send_time
-    else:
-        benchmark_duration = time.perf_counter() - benchmark_start_time
+    now = time.perf_counter()
+    benchmark_duration = now - benchmark_start_time
+    # Process the data after the num_trim_head_requests and before the num_trim_tail_requests only.
+    if num_trim_head_requests > 0:
+        outputs = outputs[num_trim_head_requests:]
+        input_requests = input_requests[num_trim_head_requests:]
+        benchmark_duration = now - outputs[0].send_time
+    if num_trim_tail_requests > 0:
+        outputs = outputs[:num_trim_tail_requests]
+        input_requests = input_requests[:num_trim_tail_requests]
+        benchmark_duration -= (now - outputs[-1].send_time - outputs[-1].latency)
 
     if profile:
         print("Stopping profiler...")
@@ -440,7 +444,6 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
-        num_warmup_requests=num_warmup_requests,
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -787,14 +790,17 @@ def main(args: argparse.Namespace):
         # Disable prompt caching in llama.cpp backend
         sampling_params["cache_prompt"] = False
 
-    # Calculate number of warmup requests
-    num_warmup_requests = 0
+    # Calculate number of trim head and tail requests
+    num_trim_head_requests = 0
+    num_trim_tail_requests = 0
     if args.max_concurrency is not None:
         num_warmup_requests = int(args.max_concurrency * args.warmup_ratio)
-        # Ensure warmup requests don't exceed total requests
-        if num_warmup_requests >= args.num_prompts:
-            print("Warning: Skipping warmup as it would leave no requests to measure")
-            num_warmup_requests = 0
+        num_trim_head_requests = int(args.max_concurrency * args.trim_head_ratio)
+        num_trim_tail_requests = int(args.max_concurrency * args.trim_tail_ratio)
+        if num_trim_head_requests + num_trim_tail_requests >= args.num_prompts:
+            print("Warning: Skipping trim requests as it would leave no requests to measure")
+            num_trim_head_requests = 0
+            num_trim_tail_requests = 0
 
     # Avoid GC processing "static" data - reduce pause times.
     gc.collect()
@@ -821,7 +827,8 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
-            num_warmup_requests=num_warmup_requests,
+            num_trim_head_requests=num_trim_head_requests,
+            num_trim_tail_requests=num_trim_tail_requests,
         )
     )
 
@@ -949,13 +956,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--warmup-ratio",
+        "--trim-head-ratio",
         type=float,
-        default=2.0,
-        help="Ratio of warmup requests to max-concurrency. "
+        default=3.0,
+        help="Ratio of trim head requests to max-concurrency. "
         "When --max-concurrency is set, this many times "
         "the max-concurrency requests will be discarded "
-        "from statistics. Default is 2.0 (discard 2x max-concurrency requests).",
+        "from statistics. Default is 3.0 (discard 3x max-concurrency requests).",
+    )
+
+    parser.add_argument(
+        "--trim-tail-ratio",
+        type=float,
+        default=1.0,
+        help="Ratio of trim tail requests to max-concurrency. "
+        "When --max-concurrency is set, this many times "
+        "the max-concurrency requests will be discarded "
+        "from statistics. Default is 1.0 (discard 1x max-concurrency requests).",
     )
 
     parser.add_argument(
