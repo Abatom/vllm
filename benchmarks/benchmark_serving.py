@@ -957,21 +957,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--trim-head-ratio",
         type=float,
-        default=3.0,
+        default=0.0,
         help="Ratio of trim head requests to max-concurrency. "
         "When --max-concurrency is set, this many times "
         "the max-concurrency requests will be discarded "
-        "from statistics. Default is 3.0 (discard 3x max-concurrency requests).",
+        "from statistics.",
     )
 
     parser.add_argument(
         "--trim-tail-ratio",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Ratio of trim tail requests to max-concurrency. "
         "When --max-concurrency is set, this many times "
         "the max-concurrency requests will be discarded "
-        "from statistics. Default is 1.0 (discard 1x max-concurrency requests).",
+        "from statistics.",
     )
 
     parser.add_argument(
