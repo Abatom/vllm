@@ -512,9 +512,9 @@ class P2pNcclEngine:
                 ncclDataTypeEnum.from_torch(tensor.dtype), dst,
                 comm, cudaStream_t(stream.cuda_stream)
             )
-            event.record(stream)
+            event.record()
 
-        event.synchronize()
+        torch.cuda.current_stream().wait_event(event)
 
     def _recv(self, comm, tensor: torch.Tensor, src: int, stream=None):
         assert tensor.device == self.device, (
@@ -531,9 +531,9 @@ class P2pNcclEngine:
                 ncclDataTypeEnum.from_torch(tensor.dtype), src,
                 comm, cudaStream_t(stream.cuda_stream)
             )
-            event.record(stream)
+            event.record()
 
-        event.synchronize()
+        torch.cuda.current_stream().wait_event(event)
 
     def close(self) -> None:
         self._listener_thread.join()
