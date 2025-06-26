@@ -310,7 +310,7 @@ class P2pNcclEngine:
                 elif data["cmd"] == "PUT":
                     tensor_id = data["tensor_id"]
                     try:
-                        tensor = torch.empty(data["shape"],
+                        tensor = torch.zeros(data["shape"],
                                              dtype=getattr(
                                                  torch, data["dtype"]),
                                              device=self.device)
