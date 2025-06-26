@@ -497,7 +497,7 @@ class P2pNcclEngine:
             sock.send(msgpack.dumps(data))
             time.sleep(3)
 
-    def _send(self, comm, tensor_id: str, tensor: torch.Tensor, dst: int, stream=None):
+    def _send(self, comm, tensor: torch.Tensor, dst: int, stream=None):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
@@ -516,7 +516,7 @@ class P2pNcclEngine:
 
         event.synchronize()
 
-    def _recv(self, comm, tensor_id: str, tensor: torch.Tensor, src: int, stream=None):
+    def _recv(self, comm, tensor: torch.Tensor, src: int, stream=None):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
