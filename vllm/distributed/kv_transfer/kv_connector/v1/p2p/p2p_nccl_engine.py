@@ -501,33 +501,37 @@ class P2pNcclEngine:
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
-        if stream is None:
-            stream = torch.cuda.current_stream()
 
+        stream = stream if stream is not None else torch.cuda.current_stream()
+
+        event = torch.cuda.Event(enable_timing=False)
         with torch.cuda.stream(stream):
             self.nccl.ncclSend(
                 buffer_type(tensor.data_ptr()), tensor.numel(),
                 ncclDataTypeEnum.from_torch(tensor.dtype), dst,
                 comm, cudaStream_t(stream.cuda_stream)
             )
+            event.record(stream)
 
-        torch.cuda.synchronize()
+        event.synchronize()
 
     def _recv(self, comm, tensor: torch.Tensor, src: int, stream=None):
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
-        if stream is None:
-            stream = torch.cuda.current_stream()
 
+        stream = stream if stream is not None else torch.cuda.current_stream()
+
+        event = torch.cuda.Event(enable_timing=False)
         with torch.cuda.stream(stream):
             self.nccl.ncclRecv(
                 buffer_type(tensor.data_ptr()), tensor.numel(),
                 ncclDataTypeEnum.from_torch(tensor.dtype), src,
                 comm, cudaStream_t(stream.cuda_stream)
             )
+            event.record(stream)
 
-        torch.cuda.synchronize()
+        event.synchronize()
 
     def close(self) -> None:
         self._listener_thread.join()
