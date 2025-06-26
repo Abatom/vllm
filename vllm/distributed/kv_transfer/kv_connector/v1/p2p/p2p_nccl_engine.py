@@ -501,7 +501,7 @@ class P2pNcclEngine:
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
-
+        assert tensor.is_contiguous(), "send buffer must be contiguous"
         stream = stream if stream is not None else torch.cuda.current_stream()
 
         event = torch.cuda.Event(enable_timing=False)
@@ -519,7 +519,7 @@ class P2pNcclEngine:
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}")
-
+        assert tensor.is_contiguous(), "send buffer must be contiguous"
         stream = stream if stream is not None else torch.cuda.current_stream()
 
         event = torch.cuda.Event(enable_timing=False)
