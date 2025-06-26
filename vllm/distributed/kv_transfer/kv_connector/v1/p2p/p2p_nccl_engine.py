@@ -511,7 +511,7 @@ class P2pNcclEngine:
                 comm, cudaStream_t(stream.cuda_stream)
             )
 
-        torch.cuda.synchronize(self.device)
+        torch.cuda.synchronize()
 
     def _recv(self, comm, tensor: torch.Tensor, src: int, stream=None):
         assert tensor.device == self.device, (
@@ -527,7 +527,7 @@ class P2pNcclEngine:
                 comm, cudaStream_t(stream.cuda_stream)
             )
 
-        torch.cuda.synchronize(self.device)
+        torch.cuda.synchronize()
 
     def close(self) -> None:
         self._listener_thread.join()
