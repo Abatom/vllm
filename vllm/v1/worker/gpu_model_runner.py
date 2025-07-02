@@ -1496,7 +1496,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         gpu_event = torch.cuda.Event()
         gpu_event.record()
         while not gpu_event.query():
-            sched_yield()
+            # It can achieve a precision of around 50 microseconds.
+            # sched_yield can achieve a precision of around 1.25 microseconds.
+            # However, this can lead to very high CPU utilization.
+            time.sleep(0)
 
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
