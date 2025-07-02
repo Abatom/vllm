@@ -1493,6 +1493,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             scheduler_output,
         )
 
+        # Eliminate global synchronization in `cudaMemcpyAsync`.
         gpu_event = torch.cuda.Event()
         gpu_event.record()
         while not gpu_event.query():
