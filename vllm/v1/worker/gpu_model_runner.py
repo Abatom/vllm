@@ -1493,6 +1493,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             scheduler_output,
         )
 
+        gpu_event = torch.cuda.Event()
+        gpu_event.record()
+        while not gpu_event.query():
+            sched_yield()
+
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
