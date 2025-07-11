@@ -134,7 +134,7 @@ for concurrency in "${CONCURRENCY_LEVELS[@]}"; do
     fi
 
     echo "Completed test - Concurrency: $concurrency, Total requests: $total_prompts" | tee -a "$RESULT_FILE"
-    echo "Results will be saved to: $RESULT_FILE" | tee -a "$RESULT_FILE"
+    echo "Results saved to: $RESULT_FILE" | tee -a "$RESULT_FILE"
 
     # System cooldown period
     echo "Initiating ${COOLDOWN_PERIOD} second cooldown period..." | tee -a "$RESULT_FILE"
