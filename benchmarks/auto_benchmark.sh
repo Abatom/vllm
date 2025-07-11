@@ -76,7 +76,7 @@ CURRENT_DATE=$(date +"%Y_%m_%d_%H_%M")
 RESULT_FILE="$LOG_FOLDER/result-${BACKEND}-${CARD}-${INPUT_LENGTH}-${OUTPUT_LENGTH}-${CURRENT_DATE}.txt"
 
 SEED=$(date +%s)
-COOLDOWN_PERIOD=3  # cooldown in seconds
+COOLDOWN_PERIOD=1  # cooldown in seconds
 
 # Initialize test environment
 mkdir -p "$LOG_FOLDER" || { echo "Failed to create log directory"; exit 1; }
@@ -134,6 +134,7 @@ for concurrency in "${CONCURRENCY_LEVELS[@]}"; do
     fi
 
     echo "Completed test - Concurrency: $concurrency, Total requests: $total_prompts" | tee -a "$RESULT_FILE"
+    echo "Results will be saved to: $RESULT_FILE" | tee -a "$RESULT_FILE"
 
     # System cooldown period
     echo "Initiating ${COOLDOWN_PERIOD} second cooldown period..." | tee -a "$RESULT_FILE"
