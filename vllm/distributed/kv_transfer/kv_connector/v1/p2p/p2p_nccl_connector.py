@@ -12,6 +12,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine)
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.utils import (
+    inject_kv_into_layer, extract_kv_from_layer)
 from vllm.distributed.parallel_state import get_world_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -123,65 +125,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if attn_metadata is None:
             return
 
-        def inject_kv_into_layer(
-            dst_kv_cache_layer: torch.Tensor,
-            src_kv_cache: torch.Tensor,
-            slot_mapping: torch.Tensor,
-            request_id: str,
-        ) -> None:
-            """Inject the KV cache into the layer.
-
-            Args:
-                dst_kv_cache_layer (torch.Tensor): the destination KV cache
-                    layer. In shape [2, num_pages, page_size, xxx] if not
-                    using MLA, [num_pages, page_size, xxx] otherwise.
-                src_kv_cache (torch.Tensor): the source KV cache. In shape
-                    [2, num_tokens, xxx] if not using MLA, [num_tokens, xxx]
-                    otherwise.
-                slot_mapping (torch.Tensor): the slot mapping. In shape
-                    [num_tokens].
-                request_id (str): request id for log
-            """
-            dst_kv_cache_layer_shape = dst_kv_cache_layer.shape
-            if isinstance(attn_metadata, MLACommonMetadata):
-                num_pages = dst_kv_cache_layer_shape[0]
-                page_size = dst_kv_cache_layer_shape[1]
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(
-                    num_pages * page_size, -1)
-                self.check_tensors_except_dim(dst_kv_cache_layer, src_kv_cache,
-                                              0)
-                num_token = src_kv_cache.shape[0]
-                if len(slot_mapping) == num_token:
-                    dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
-                else:
-                    dst_kv_cache_layer[slot_mapping[:num_token],
-                                       ...] = src_kv_cache
-                    logger.warning(
-                        "🚧src_kv_cache does not match, num_slot:%d, "
-                        "num_token:%d, request_id:%s", len(slot_mapping),
-                        num_token, request_id)
-
-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
-            else:
-                num_pages = dst_kv_cache_layer_shape[1]
-                page_size = dst_kv_cache_layer_shape[2]
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(
-                    2, num_pages * page_size, -1)
-                self.check_tensors_except_dim(dst_kv_cache_layer, src_kv_cache,
-                                              1)
-                num_token = src_kv_cache.shape[1]
-                if len(slot_mapping) == num_token:
-                    dst_kv_cache_layer[:, slot_mapping, ...] = src_kv_cache
-                else:
-                    dst_kv_cache_layer[:, slot_mapping[:num_token],
-                                       ...] = src_kv_cache
-                    logger.warning(
-                        "🚧src_kv_cache does not match, num_slot:%d, "
-                        "num_token:%d, request_id:%s", len(slot_mapping),
-                        num_token, request_id)
-
-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
-
         # Get the metadata
         metadata: KVConnectorMetadata = \
             self._get_connector_metadata()
@@ -205,7 +148,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                                    request.request_id)
                     continue
 
-                inject_kv_into_layer(kv_cache_layer, kv_cache,
+                inject_kv_into_layer(attn_metadata, kv_cache_layer, kv_cache,
                                      request.slot_mapping, request.request_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -238,32 +181,15 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         assert self.p2p_nccl_engine is not None
 
-        def extract_kv_from_layer(
-            layer: torch.Tensor,
-            slot_mapping: torch.Tensor,
-        ) -> torch.Tensor:
-            """Extract the KV cache from the layer.
-
-            Assume the shape of the layer is (2, num_pages, page_size, xxx)
-            if MLA is not used, and (num_pages, page_size, xxx) otherwise.
-            """
-            if isinstance(attn_metadata, MLACommonMetadata):
-                num_pages, page_size = layer.shape[0], layer.shape[1]
-                return layer.reshape(num_pages * page_size, -1)[slot_mapping,
-                                                                ...]
-            num_pages, page_size = layer.shape[1], layer.shape[2]
-            return layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping,
-                                                               ...]
-
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
-            kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
             self.p2p_nccl_engine.send_tensor(request_id + "#" + layer_name,
-                                             kv_cache, remote_address)
+                                             kv_layer, remote_address,
+                                             request.slot_mapping)
 
     def wait_for_save(self):
         if self.is_producer:
