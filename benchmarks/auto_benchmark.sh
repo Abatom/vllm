@@ -12,6 +12,9 @@ PROMPTS_PER_CONCURRENCY=10
 TOKENIZER_PATH="Llama-3.1-8B-Instruct"
 MODEL="base_model"
 LOG_FOLDER="auto_benchmark"
+REQUEST_RATE=1000
+TRIM_HEAD_RATIO=0
+TRIM_TAIL_RATIO=0
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -61,11 +64,24 @@ while [[ $# -gt 0 ]]; do
             LOG_FOLDER="$2"
             shift 2
             ;;
+        --request-rate)
+            REQUEST_RATE="$2"
+            shift 2
+            ;;
+        --trim-head-ratio)
+            TRIM_HEAD_RATIO="$2"
+            shift 2
+            ;;
+        --trim-tail-ratio)
+            TRIM_TAIL_RATIO="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             echo "Usage: $0 [--server-ip IP] [--server-port PORT] [--input-length LEN] [--output-length LEN]"
             echo "       [--backend BACKEND] [--card CARD] [--concurrency-levels LIST] [--prompts-per-concurrency NUM]"
             echo "       [--tokenizer-path PATH] [--model-name MODEL] [--log-folder FOLDER]"
+            echo "       [--request-rate RATE] [--trim-head-ratio RATIO] [--trim-tail-ratio RATIO]"
             exit 1
             ;;
     esac
@@ -98,6 +114,9 @@ echo "  Concurrency Levels: ${CONCURRENCY_LEVELS[*]}" | tee -a "$RESULT_FILE"
 echo "  Prompts per Concurrency: $PROMPTS_PER_CONCURRENCY" | tee -a "$RESULT_FILE"
 echo "  Tokenizer Path: $TOKENIZER_PATH" | tee -a "$RESULT_FILE"
 echo "  Log Folder: $LOG_FOLDER" | tee -a "$RESULT_FILE"
+echo "  Request Rate: $REQUEST_RATE" | tee -a "$RESULT_FILE"
+echo "  Trim Head Ratio: $TRIM_HEAD_RATIO" | tee -a "$RESULT_FILE"
+echo "  Trim Tail Ratio: $TRIM_TAIL_RATIO" | tee -a "$RESULT_FILE"
 
 # Main test execution loop
 for concurrency in "${CONCURRENCY_LEVELS[@]}"; do
@@ -122,11 +141,11 @@ for concurrency in "${CONCURRENCY_LEVELS[@]}"; do
         --metric-percentiles 90,95,99 \
         --seed $SEED \
         --trust-remote-code \
-        --request-rate 1000 \
+        --request-rate $REQUEST_RATE \
         --max-concurrency $concurrency \
         --num-prompts $total_prompts \
-        --trim-head-ratio 2.0 \
-        --trim-tail-ratio 1.0 2>&1 | tee -a "$benchmark_log" "$RESULT_FILE"
+        --trim-head-ratio $TRIM_HEAD_RATIO \
+        --trim-tail-ratio $TRIM_TAIL_RATIO 2>&1 | tee -a "$benchmark_log" "$RESULT_FILE"
 
     # Verify command execution status
     if [ $? -ne 0 ]; then
@@ -154,4 +173,7 @@ echo -e "\nAll benchmark tests completed successfully" | tee -a "$RESULT_FILE"
 #    --prompts-per-concurrency 10 \
 #    --tokenizer-path /home/Llama-3.1-8B-Instruct \
 #    --model-name base_model \
-#    --log-folder auto_benchmark
+#    --log-folder auto_benchmark \
+#    --request-rate 1000 \
+#    --trim-head-ratio 2.0 \
+#    --trim-tail-ratio 1.0
