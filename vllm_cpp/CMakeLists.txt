@@ -29,6 +29,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # Build options
 option(VLLM_BUILD_TESTS "Build test programs" ON)
 option(VLLM_BUILD_EXAMPLES "Build example programs" ON)
+option(VLLM_BUILD_SERVER "Build API server" ON)
 option(VLLM_USE_FLASH_ATTENTION "Use FlashAttention" ON)
 option(VLLM_USE_CUTLASS "Use CUTLASS for optimized kernels" ON)
 
@@ -70,6 +71,7 @@ endif()
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${TORCH_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
@@ -177,6 +179,26 @@ if(VLLM_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
+# API Server
+if(VLLM_BUILD_SERVER)
+    # Find threading library
+    find_package(Threads REQUIRED)
+    
+    add_executable(vllm_server
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/server/main.cpp
+    )
+    
+    target_link_libraries(vllm_server
+        vllm_cpp
+        Threads::Threads
+    )
+    
+    # Install server
+    install(TARGETS vllm_server
+        RUNTIME DESTINATION bin
+    )
+endif()
+
 # Print configuration summary
 message(STATUS "")
 message(STATUS "vLLM C++ Configuration:")
@@ -187,4 +209,5 @@ message(STATUS "  FlashAttention: ${VLLM_USE_FLASH_ATTENTION}")
 message(STATUS "  CUTLASS: ${VLLM_USE_CUTLASS}")
 message(STATUS "  Build Tests: ${VLLM_BUILD_TESTS}")
 message(STATUS "  Build Examples: ${VLLM_BUILD_EXAMPLES}")
+message(STATUS "  Build Server: ${VLLM_BUILD_SERVER}")
 message(STATUS "")

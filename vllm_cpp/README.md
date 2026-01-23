@@ -6,6 +6,7 @@ A C++ implementation of vLLM for NVIDIA GPUs, focusing on the V1 engine architec
 
 - **V1 Engine Only**: Clean implementation based on vLLM's V1 architecture
 - **NVIDIA GPU Support**: Optimized CUDA kernels for NVIDIA GPUs
+- **OpenAI-Compatible API Server**: HTTP server with /v1/chat/completions, /v1/completions endpoints
 - **Supported Models**:
   - Qwen2 (Qwen2-7B, Qwen2-72B, etc.)
   - MiMoV2Flash (Mixture of Experts with Flash Attention)
@@ -115,6 +116,62 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 ```
 
 ## Usage
+
+### Starting the API Server
+
+The easiest way to use vLLM C++ is through the OpenAI-compatible API server:
+
+```bash
+# Start the server with a MiMoV2Flash model
+./vllm_server --model /path/to/mimo-v2-flash --port 8000
+
+# Or with a Qwen2 model
+./vllm_server --model /path/to/Qwen2-7B --port 8000 --served-model-name qwen2-7b
+```
+
+**Server Options:**
+```
+--model <path>              Path to the model directory (required)
+--served-model-name <name>  Name to serve the model as
+--host <host>               Host to bind to (default: 0.0.0.0)
+--port <port>               Port to listen on (default: 8000)
+--max-model-len <len>       Maximum model context length
+--gpu-memory-utilization <f> GPU memory utilization (default: 0.9)
+--tensor-parallel-size <n>  Tensor parallel size (default: 1)
+```
+
+### Making API Requests
+
+**Chat Completions:**
+```bash
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "mimo-v2-flash",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello!"}
+        ],
+        "max_tokens": 100,
+        "temperature": 0.7
+    }'
+```
+
+**Text Completions:**
+```bash
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "mimo-v2-flash",
+        "prompt": "The capital of France is",
+        "max_tokens": 50
+    }'
+```
+
+**List Models:**
+```bash
+curl http://localhost:8000/v1/models
+```
 
 ### Basic Inference
 
