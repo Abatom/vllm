@@ -6,8 +6,9 @@
 cmake_minimum_required(VERSION 3.26)
 
 # Set CUDA architectures before project()
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
+# Supports Ampere (80, 86), Ada Lovelace (89), and Hopper (90)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "OFF")
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
 endif()
 
 project(vllm_cpp 

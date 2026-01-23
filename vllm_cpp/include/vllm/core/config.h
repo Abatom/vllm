@@ -3,7 +3,14 @@
 #pragma once
 
 #include "vllm/common.h"
+
+// nlohmann/json is optional - if available, enables JSON config loading
+#if __has_include(<nlohmann/json.hpp>)
 #include <nlohmann/json.hpp>
+#define VLLM_HAS_JSON 1
+#else
+#define VLLM_HAS_JSON 0
+#endif
 
 namespace vllm {
 
@@ -42,8 +49,10 @@ struct ModelConfig {
     // Load from HuggingFace config.json
     static ModelConfig from_json(const std::string& json_path);
     
-    // Serialize to JSON
+#if VLLM_HAS_JSON
+    // Serialize to JSON (requires nlohmann/json)
     nlohmann::json to_json() const;
+#endif
 };
 
 // Cache configuration
@@ -122,6 +131,7 @@ inline ModelConfig ModelConfig::from_json(const std::string& json_path) {
     return config;
 }
 
+#if VLLM_HAS_JSON
 inline nlohmann::json ModelConfig::to_json() const {
     nlohmann::json j;
     j["model_name"] = model_name;
@@ -138,6 +148,7 @@ inline nlohmann::json ModelConfig::to_json() const {
     j["tie_word_embeddings"] = tie_word_embeddings;
     return j;
 }
+#endif
 
 inline VllmConfig VllmConfig::create_default(const std::string& model_path) {
     VllmConfig config;

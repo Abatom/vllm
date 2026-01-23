@@ -7,6 +7,7 @@
 
 namespace vllm {
 
+#if VLLM_HAS_JSON
 // Load model config from HuggingFace config.json
 ModelConfig load_model_config_from_json(const std::string& json_path) {
     ModelConfig config;
@@ -80,5 +81,11 @@ ModelConfig load_model_config_from_json(const std::string& json_path) {
     config.compute_derived();
     return config;
 }
+#else
+// Stub when nlohmann/json is not available
+ModelConfig load_model_config_from_json(const std::string& json_path) {
+    throw std::runtime_error("JSON support not available. Please install nlohmann/json library.");
+}
+#endif
 
 }  // namespace vllm
