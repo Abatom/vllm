@@ -193,7 +193,7 @@ public:
     
     void initialize() {
         // Set device
-        torch::cuda::set_device(config_.device_id);
+        c10::cuda::set_device(config_.device_id);
         
         // Initialize KV cache manager
         kv_cache_manager_ = std::make_unique<KVCacheManager>(

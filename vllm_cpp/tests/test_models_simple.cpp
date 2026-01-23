@@ -211,7 +211,7 @@ int main() {
     std::cout << std::endl;
     
     // Initialize CUDA
-    torch::cuda::set_device(0);
+    c10::cuda::set_device(0);
     
     int passed = 0;
     int failed = 0;

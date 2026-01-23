@@ -38,7 +38,7 @@ inline std::string version() {
 
 // Initialize vLLM (call once at startup)
 inline void initialize(int device_id = 0) {
-    torch::cuda::set_device(device_id);
+    c10::cuda::set_device(device_id);
 }
 
 }  // namespace vllm

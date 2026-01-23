@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     
     try {
         // Initialize CUDA
-        torch::cuda::set_device(0);
+        c10::cuda::set_device(0);
         
         // Create MiMoV2Flash configuration
         MiMoV2FlashConfig config;

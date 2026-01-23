@@ -10,6 +10,7 @@
 #include "vllm/model_executor/layers/layernorm.h"
 #include "vllm/model_executor/layers/activation.h"
 #include "vllm/model_executor/layers/rotary_embedding.h"
+#include "vllm/model_executor/layers/mlp.h"
 
 using namespace vllm;
 
@@ -141,7 +142,7 @@ int main() {
     std::cout << std::endl;
     
     // Initialize CUDA
-    torch::cuda::set_device(0);
+    c10::cuda::set_device(0);
     
     int passed = 0;
     int failed = 0;
