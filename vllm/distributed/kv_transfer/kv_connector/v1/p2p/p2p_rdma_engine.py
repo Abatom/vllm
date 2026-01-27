@@ -4,13 +4,14 @@
 P2P RDMA Engine for KV cache transfer.
 
 This module provides a P2P engine that uses:
-- RDMA (via raw ibverbs) for inter-node communication between different machines
+- RDMA (via raw ibverbs with Queue Pairs) for inter-node communication
 - NVLink (via CUDA P2P with copy engine) for intra-node communication
 
 Key features:
 - Zero-copy GPU memory transfers via GPUDirect RDMA
 - No temporary GPU buffers - direct memory registration
 - SM-free transfers using DMA/copy engines only
+- Similar architecture to Mooncake's TransferEngine
 """
 
 import ctypes
@@ -22,7 +23,7 @@ import struct
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgpack
@@ -39,32 +40,43 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MEM_POOL_SIZE_GB = 32
 
-# RDMA constants from ibverbs
+# ============================================================================
+# RDMA Constants from libibverbs
+# ============================================================================
+
+# Access flags
 IBV_ACCESS_LOCAL_WRITE = 1
 IBV_ACCESS_REMOTE_WRITE = 2
 IBV_ACCESS_REMOTE_READ = 4
 IBV_ACCESS_REMOTE_ATOMIC = 8
 
+# Work request opcodes
 IBV_WR_RDMA_WRITE = 0
 IBV_WR_RDMA_WRITE_WITH_IMM = 1
 IBV_WR_SEND = 2
 IBV_WR_RDMA_READ = 3
 
+# Send flags
 IBV_SEND_SIGNALED = 1 << 0
 IBV_SEND_INLINE = 1 << 3
 
+# Work completion status
 IBV_WC_SUCCESS = 0
-IBV_WC_SEND = 0
-IBV_WC_RDMA_WRITE = 1
-IBV_WC_RDMA_READ = 2
-IBV_WC_RECV = 128
 
+# Queue pair types
 IBV_QPT_RC = 2  # Reliable Connection
 
+# Queue pair states
 IBV_QPS_RESET = 0
 IBV_QPS_INIT = 1
-IBV_QPS_RTR = 2
-IBV_QPS_RTS = 3
+IBV_QPS_RTR = 2  # Ready to Receive
+IBV_QPS_RTS = 3  # Ready to Send
+
+# MTU values
+IBV_MTU_4096 = 5
+
+# Port states
+IBV_PORT_ACTIVE = 4
 
 
 def get_hostname() -> str:
@@ -107,247 +119,360 @@ class RdmaMemoryRegion:
     length: int
     lkey: int
     rkey: int
-    mr: ctypes.c_void_p
+    mr_ptr: ctypes.c_void_p
 
 
 @dataclass
-class RdmaConnectionInfo:
-    """RDMA connection information for queue pair setup."""
-    lid: int  # Local ID
-    qpn: int  # Queue Pair Number
-    psn: int  # Packet Sequence Number
-    gid: bytes  # Global ID (16 bytes)
+class QueuePairInfo:
+    """Queue Pair connection information for RDMA."""
+    qp_num: int
+    lid: int
+    psn: int
+    gid: bytes  # 16 bytes GID
 
 
 @dataclass
-class RemoteMemoryInfo:
-    """Remote memory region info for RDMA operations."""
-    addr: int
-    rkey: int
-    size: int
+class RemoteQPInfo:
+    """Remote Queue Pair info for connection."""
+    qp_num: int
+    lid: int
+    psn: int
+    gid: bytes
+    # Remote memory regions
+    mem_regions: dict[int, tuple[int, int]] = field(default_factory=dict)  # addr -> (rkey, size)
 
 
-class IbverbsWrapper:
+# ============================================================================
+# ibverbs Structure Definitions
+# ============================================================================
+
+class ibv_gid(ctypes.Structure):
+    _fields_ = [("raw", ctypes.c_uint8 * 16)]
+
+
+class ibv_global_route(ctypes.Structure):
+    _fields_ = [
+        ("dgid", ibv_gid),
+        ("flow_label", ctypes.c_uint32),
+        ("sgid_index", ctypes.c_uint8),
+        ("hop_limit", ctypes.c_uint8),
+        ("traffic_class", ctypes.c_uint8),
+    ]
+
+
+class ibv_ah_attr(ctypes.Structure):
+    _fields_ = [
+        ("grh", ibv_global_route),
+        ("dlid", ctypes.c_uint16),
+        ("sl", ctypes.c_uint8),
+        ("src_path_bits", ctypes.c_uint8),
+        ("static_rate", ctypes.c_uint8),
+        ("is_global", ctypes.c_uint8),
+        ("port_num", ctypes.c_uint8),
+    ]
+
+
+class ibv_mr(ctypes.Structure):
+    _fields_ = [
+        ("context", ctypes.c_void_p),
+        ("pd", ctypes.c_void_p),
+        ("addr", ctypes.c_void_p),
+        ("length", ctypes.c_size_t),
+        ("handle", ctypes.c_uint32),
+        ("lkey", ctypes.c_uint32),
+        ("rkey", ctypes.c_uint32),
+    ]
+
+
+class ibv_sge(ctypes.Structure):
+    _fields_ = [
+        ("addr", ctypes.c_uint64),
+        ("length", ctypes.c_uint32),
+        ("lkey", ctypes.c_uint32),
+    ]
+
+
+class ibv_send_wr(ctypes.Structure):
+    pass
+
+
+ibv_send_wr._fields_ = [
+    ("wr_id", ctypes.c_uint64),
+    ("next", ctypes.POINTER(ibv_send_wr)),
+    ("sg_list", ctypes.POINTER(ibv_sge)),
+    ("num_sge", ctypes.c_int),
+    ("opcode", ctypes.c_int),
+    ("send_flags", ctypes.c_uint),
+    ("imm_data", ctypes.c_uint32),
+    # RDMA specific fields (union in C)
+    ("remote_addr", ctypes.c_uint64),
+    ("rkey", ctypes.c_uint32),
+]
+
+
+class ibv_recv_wr(ctypes.Structure):
+    pass
+
+
+ibv_recv_wr._fields_ = [
+    ("wr_id", ctypes.c_uint64),
+    ("next", ctypes.POINTER(ibv_recv_wr)),
+    ("sg_list", ctypes.POINTER(ibv_sge)),
+    ("num_sge", ctypes.c_int),
+]
+
+
+class ibv_wc(ctypes.Structure):
+    _fields_ = [
+        ("wr_id", ctypes.c_uint64),
+        ("status", ctypes.c_int),
+        ("opcode", ctypes.c_int),
+        ("vendor_err", ctypes.c_uint32),
+        ("byte_len", ctypes.c_uint32),
+        ("imm_data", ctypes.c_uint32),
+        ("qp_num", ctypes.c_uint32),
+        ("src_qp", ctypes.c_uint32),
+        ("wc_flags", ctypes.c_int),
+        ("pkey_index", ctypes.c_uint16),
+        ("slid", ctypes.c_uint16),
+        ("sl", ctypes.c_uint8),
+        ("dlid_path_bits", ctypes.c_uint8),
+    ]
+
+
+class ibv_port_attr(ctypes.Structure):
+    _fields_ = [
+        ("state", ctypes.c_int),
+        ("max_mtu", ctypes.c_int),
+        ("active_mtu", ctypes.c_int),
+        ("gid_tbl_len", ctypes.c_int),
+        ("port_cap_flags", ctypes.c_uint32),
+        ("max_msg_sz", ctypes.c_uint32),
+        ("bad_pkey_cntr", ctypes.c_uint32),
+        ("qkey_viol_cntr", ctypes.c_uint32),
+        ("pkey_tbl_len", ctypes.c_uint16),
+        ("lid", ctypes.c_uint16),
+        ("sm_lid", ctypes.c_uint16),
+        ("lmc", ctypes.c_uint8),
+        ("max_vl_num", ctypes.c_uint8),
+        ("sm_sl", ctypes.c_uint8),
+        ("subnet_timeout", ctypes.c_uint8),
+        ("init_type_reply", ctypes.c_uint8),
+        ("active_width", ctypes.c_uint8),
+        ("active_speed", ctypes.c_uint8),
+        ("phys_state", ctypes.c_uint8),
+        ("link_layer", ctypes.c_uint8),
+        ("flags", ctypes.c_uint8),
+        ("port_cap_flags2", ctypes.c_uint16),
+    ]
+
+
+class ibv_qp_init_attr(ctypes.Structure):
+    _fields_ = [
+        ("qp_context", ctypes.c_void_p),
+        ("send_cq", ctypes.c_void_p),
+        ("recv_cq", ctypes.c_void_p),
+        ("srq", ctypes.c_void_p),
+        ("cap_max_send_wr", ctypes.c_uint32),
+        ("cap_max_recv_wr", ctypes.c_uint32),
+        ("cap_max_send_sge", ctypes.c_uint32),
+        ("cap_max_recv_sge", ctypes.c_uint32),
+        ("cap_max_inline_data", ctypes.c_uint32),
+        ("qp_type", ctypes.c_int),
+        ("sq_sig_all", ctypes.c_int),
+    ]
+
+
+class ibv_qp_attr(ctypes.Structure):
+    _fields_ = [
+        ("qp_state", ctypes.c_int),
+        ("cur_qp_state", ctypes.c_int),
+        ("path_mtu", ctypes.c_int),
+        ("path_mig_state", ctypes.c_int),
+        ("qkey", ctypes.c_uint32),
+        ("rq_psn", ctypes.c_uint32),
+        ("sq_psn", ctypes.c_uint32),
+        ("dest_qp_num", ctypes.c_uint32),
+        ("qp_access_flags", ctypes.c_int),
+        ("cap_max_send_wr", ctypes.c_uint32),
+        ("cap_max_recv_wr", ctypes.c_uint32),
+        ("cap_max_send_sge", ctypes.c_uint32),
+        ("cap_max_recv_sge", ctypes.c_uint32),
+        ("cap_max_inline_data", ctypes.c_uint32),
+        ("ah_attr", ibv_ah_attr),
+        ("alt_ah_attr", ibv_ah_attr),
+        ("pkey_index", ctypes.c_uint16),
+        ("alt_pkey_index", ctypes.c_uint16),
+        ("en_sqd_async_notify", ctypes.c_uint8),
+        ("sq_draining", ctypes.c_uint8),
+        ("max_rd_atomic", ctypes.c_uint8),
+        ("max_dest_rd_atomic", ctypes.c_uint8),
+        ("min_rnr_timer", ctypes.c_uint8),
+        ("port_num", ctypes.c_uint8),
+        ("timeout", ctypes.c_uint8),
+        ("retry_cnt", ctypes.c_uint8),
+        ("rnr_retry", ctypes.c_uint8),
+        ("alt_port_num", ctypes.c_uint8),
+        ("alt_timeout", ctypes.c_uint8),
+        ("rate_limit", ctypes.c_uint32),
+    ]
+
+
+# ============================================================================
+# RDMA Transport Implementation
+# ============================================================================
+
+class RdmaTransport:
     """
-    Pure Python wrapper for libibverbs.
+    Raw RDMA transport using libibverbs.
     
-    Provides direct RDMA operations without UCX overhead.
+    Implements Queue Pairs for reliable connection-based RDMA transfers.
+    Supports GPUDirect RDMA for zero-copy GPU memory transfers.
     """
     
-    # ibverbs structure definitions
-    class ibv_device(ctypes.Structure):
-        pass
+    # QP modification masks
+    IBV_QP_STATE = 1 << 0
+    IBV_QP_CUR_STATE = 1 << 1
+    IBV_QP_EN_SQD_ASYNC_NOTIFY = 1 << 2
+    IBV_QP_ACCESS_FLAGS = 1 << 3
+    IBV_QP_PKEY_INDEX = 1 << 4
+    IBV_QP_PORT = 1 << 5
+    IBV_QP_QKEY = 1 << 6
+    IBV_QP_AV = 1 << 7
+    IBV_QP_PATH_MTU = 1 << 8
+    IBV_QP_TIMEOUT = 1 << 9
+    IBV_QP_RETRY_CNT = 1 << 10
+    IBV_QP_RNR_RETRY = 1 << 11
+    IBV_QP_RQ_PSN = 1 << 12
+    IBV_QP_MAX_QP_RD_ATOMIC = 1 << 13
+    IBV_QP_ALT_PATH = 1 << 14
+    IBV_QP_MIN_RNR_TIMER = 1 << 15
+    IBV_QP_SQ_PSN = 1 << 16
+    IBV_QP_MAX_DEST_RD_ATOMIC = 1 << 17
+    IBV_QP_PATH_MIG_STATE = 1 << 18
+    IBV_QP_CAP = 1 << 19
+    IBV_QP_DEST_QPN = 1 << 20
     
-    class ibv_context(ctypes.Structure):
-        pass
-    
-    class ibv_pd(ctypes.Structure):
-        pass
-    
-    class ibv_mr(ctypes.Structure):
-        _fields_ = [
-            ("context", ctypes.c_void_p),
-            ("pd", ctypes.c_void_p),
-            ("addr", ctypes.c_void_p),
-            ("length", ctypes.c_size_t),
-            ("handle", ctypes.c_uint32),
-            ("lkey", ctypes.c_uint32),
-            ("rkey", ctypes.c_uint32),
-        ]
-    
-    class ibv_cq(ctypes.Structure):
-        pass
-    
-    class ibv_qp(ctypes.Structure):
-        pass
-    
-    class ibv_sge(ctypes.Structure):
-        _fields_ = [
-            ("addr", ctypes.c_uint64),
-            ("length", ctypes.c_uint32),
-            ("lkey", ctypes.c_uint32),
-        ]
-    
-    class ibv_send_wr(ctypes.Structure):
-        pass
-    
-    class ibv_recv_wr(ctypes.Structure):
-        pass
-    
-    class ibv_wc(ctypes.Structure):
-        _fields_ = [
-            ("wr_id", ctypes.c_uint64),
-            ("status", ctypes.c_int),
-            ("opcode", ctypes.c_int),
-            ("vendor_err", ctypes.c_uint32),
-            ("byte_len", ctypes.c_uint32),
-            ("imm_data", ctypes.c_uint32),
-            ("qp_num", ctypes.c_uint32),
-            ("src_qp", ctypes.c_uint32),
-            ("wc_flags", ctypes.c_int),
-            ("pkey_index", ctypes.c_uint16),
-            ("slid", ctypes.c_uint16),
-            ("sl", ctypes.c_uint8),
-            ("dlid_path_bits", ctypes.c_uint8),
-        ]
-    
-    class ibv_gid(ctypes.Structure):
-        _fields_ = [("raw", ctypes.c_uint8 * 16)]
-    
-    class ibv_port_attr(ctypes.Structure):
-        _fields_ = [
-            ("state", ctypes.c_int),
-            ("max_mtu", ctypes.c_int),
-            ("active_mtu", ctypes.c_int),
-            ("gid_tbl_len", ctypes.c_int),
-            ("port_cap_flags", ctypes.c_uint32),
-            ("max_msg_sz", ctypes.c_uint32),
-            ("bad_pkey_cntr", ctypes.c_uint32),
-            ("qkey_viol_cntr", ctypes.c_uint32),
-            ("pkey_tbl_len", ctypes.c_uint16),
-            ("lid", ctypes.c_uint16),
-            ("sm_lid", ctypes.c_uint16),
-            ("lmc", ctypes.c_uint8),
-            ("max_vl_num", ctypes.c_uint8),
-            ("sm_sl", ctypes.c_uint8),
-            ("subnet_timeout", ctypes.c_uint8),
-            ("init_type_reply", ctypes.c_uint8),
-            ("active_width", ctypes.c_uint8),
-            ("active_speed", ctypes.c_uint8),
-            ("phys_state", ctypes.c_uint8),
-            ("link_layer", ctypes.c_uint8),
-            ("flags", ctypes.c_uint8),
-            ("port_cap_flags2", ctypes.c_uint16),
-        ]
-    
-    def __init__(self, device_name: str | None = None):
+    def __init__(self, device_name: str | None = None, ib_port: int = 1, gid_index: int = 0):
+        self.device_name = device_name
+        self.ib_port = ib_port
+        self.gid_index = gid_index
+        
         self.lib = None
-        self.device = None
         self.context = None
         self.pd = None
-        self.cq = None
+        self.send_cq = None
+        self.recv_cq = None
         self.port_attr = None
         self.gid = None
         self.lid = 0
-        self._registered_mrs: dict[int, ctypes.c_void_p] = {}
+        
+        # Queue pairs: remote_address -> (qp_ptr, qp_num)
+        self._qps: dict[str, tuple[ctypes.c_void_p, int]] = {}
+        # Registered memory regions: addr -> RdmaMemoryRegion
+        self._mrs: dict[int, RdmaMemoryRegion] = {}
+        # Lock for thread safety
+        self._lock = threading.Lock()
         
         self._load_library()
         if self.lib is not None:
-            self._init_device(device_name)
+            self._init_device()
     
     def _load_library(self):
         """Load libibverbs shared library."""
-        try:
-            # Try loading ibverbs
-            for lib_name in ["libibverbs.so.1", "libibverbs.so", "ibverbs"]:
-                try:
-                    self.lib = ctypes.CDLL(lib_name, mode=ctypes.RTLD_GLOBAL)
-                    logger.info("Loaded RDMA library: %s", lib_name)
-                    break
-                except OSError:
-                    continue
-            
-            if self.lib is None:
-                logger.warning(
-                    "libibverbs not found. RDMA transport unavailable. "
-                    "Install with: apt-get install libibverbs-dev"
-                )
+        lib_names = ["libibverbs.so.1", "libibverbs.so", "libmlx5.so.1"]
+        
+        for lib_name in lib_names:
+            try:
+                self.lib = ctypes.CDLL(lib_name, mode=ctypes.RTLD_GLOBAL)
+                logger.info("Loaded RDMA library: %s", lib_name)
+                self._setup_functions()
                 return
-            
-            # Setup function prototypes
-            self._setup_functions()
-            
-        except Exception as e:
-            logger.warning("Failed to load ibverbs: %s", e)
-            self.lib = None
+            except OSError:
+                continue
+        
+        logger.warning(
+            "libibverbs not found. RDMA transport unavailable. "
+            "Install with: apt-get install libibverbs-dev rdma-core"
+        )
     
     def _setup_functions(self):
-        """Setup ctypes function prototypes."""
+        """Setup ctypes function prototypes for ibverbs."""
         if self.lib is None:
             return
         
-        # ibv_get_device_list
+        # Device management
         self.lib.ibv_get_device_list.argtypes = [ctypes.POINTER(ctypes.c_int)]
         self.lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
-        
-        # ibv_free_device_list
         self.lib.ibv_free_device_list.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        self.lib.ibv_free_device_list.restype = None
-        
-        # ibv_get_device_name
         self.lib.ibv_get_device_name.argtypes = [ctypes.c_void_p]
         self.lib.ibv_get_device_name.restype = ctypes.c_char_p
-        
-        # ibv_open_device
         self.lib.ibv_open_device.argtypes = [ctypes.c_void_p]
         self.lib.ibv_open_device.restype = ctypes.c_void_p
-        
-        # ibv_close_device
         self.lib.ibv_close_device.argtypes = [ctypes.c_void_p]
         self.lib.ibv_close_device.restype = ctypes.c_int
         
-        # ibv_alloc_pd
+        # Protection domain
         self.lib.ibv_alloc_pd.argtypes = [ctypes.c_void_p]
         self.lib.ibv_alloc_pd.restype = ctypes.c_void_p
-        
-        # ibv_dealloc_pd
         self.lib.ibv_dealloc_pd.argtypes = [ctypes.c_void_p]
         self.lib.ibv_dealloc_pd.restype = ctypes.c_int
         
-        # ibv_reg_mr
+        # Memory registration
         self.lib.ibv_reg_mr.argtypes = [
-            ctypes.c_void_p,  # pd
-            ctypes.c_void_p,  # addr
-            ctypes.c_size_t,  # length
-            ctypes.c_int,     # access
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
         ]
-        self.lib.ibv_reg_mr.restype = ctypes.POINTER(self.ibv_mr)
-        
-        # ibv_dereg_mr
-        self.lib.ibv_dereg_mr.argtypes = [ctypes.POINTER(self.ibv_mr)]
+        self.lib.ibv_reg_mr.restype = ctypes.POINTER(ibv_mr)
+        self.lib.ibv_dereg_mr.argtypes = [ctypes.POINTER(ibv_mr)]
         self.lib.ibv_dereg_mr.restype = ctypes.c_int
         
-        # ibv_create_cq
+        # Completion queue
         self.lib.ibv_create_cq.argtypes = [
-            ctypes.c_void_p,  # context
-            ctypes.c_int,     # cqe
-            ctypes.c_void_p,  # cq_context
-            ctypes.c_void_p,  # channel
-            ctypes.c_int,     # comp_vector
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_int
         ]
         self.lib.ibv_create_cq.restype = ctypes.c_void_p
-        
-        # ibv_destroy_cq
         self.lib.ibv_destroy_cq.argtypes = [ctypes.c_void_p]
         self.lib.ibv_destroy_cq.restype = ctypes.c_int
+        self.lib.ibv_poll_cq.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ibv_wc)
+        ]
+        self.lib.ibv_poll_cq.restype = ctypes.c_int
         
-        # ibv_query_port
+        # Queue pair
+        self.lib.ibv_create_qp.argtypes = [ctypes.c_void_p, ctypes.POINTER(ibv_qp_init_attr)]
+        self.lib.ibv_create_qp.restype = ctypes.c_void_p
+        self.lib.ibv_destroy_qp.argtypes = [ctypes.c_void_p]
+        self.lib.ibv_destroy_qp.restype = ctypes.c_int
+        self.lib.ibv_modify_qp.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ibv_qp_attr), ctypes.c_int
+        ]
+        self.lib.ibv_modify_qp.restype = ctypes.c_int
+        
+        # Port and GID
         self.lib.ibv_query_port.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint8,
-            ctypes.POINTER(self.ibv_port_attr),
+            ctypes.c_void_p, ctypes.c_uint8, ctypes.POINTER(ibv_port_attr)
         ]
         self.lib.ibv_query_port.restype = ctypes.c_int
-        
-        # ibv_query_gid
         self.lib.ibv_query_gid.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint8,
-            ctypes.c_int,
-            ctypes.POINTER(self.ibv_gid),
+            ctypes.c_void_p, ctypes.c_uint8, ctypes.c_int, ctypes.POINTER(ibv_gid)
         ]
         self.lib.ibv_query_gid.restype = ctypes.c_int
         
-        # ibv_poll_cq
-        self.lib.ibv_poll_cq.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.POINTER(self.ibv_wc),
+        # Work requests
+        self.lib.ibv_post_send.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ibv_send_wr),
+            ctypes.POINTER(ctypes.POINTER(ibv_send_wr))
         ]
-        self.lib.ibv_poll_cq.restype = ctypes.c_int
+        self.lib.ibv_post_send.restype = ctypes.c_int
+        self.lib.ibv_post_recv.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ibv_recv_wr),
+            ctypes.POINTER(ctypes.POINTER(ibv_recv_wr))
+        ]
+        self.lib.ibv_post_recv.restype = ctypes.c_int
     
-    def _init_device(self, device_name: str | None = None):
-        """Initialize RDMA device."""
+    def _init_device(self):
+        """Initialize RDMA device, PD, and CQs."""
         if self.lib is None:
             return
         
@@ -361,7 +486,7 @@ class IbverbsWrapper:
                 self.lib = None
                 return
             
-            # Find device
+            # Select device
             selected_device = None
             for i in range(num_devices.value):
                 dev = device_list[i]
@@ -369,75 +494,83 @@ class IbverbsWrapper:
                     name = self.lib.ibv_get_device_name(dev)
                     if name:
                         name_str = name.decode('utf-8')
-                        if device_name is None or name_str == device_name:
+                        if self.device_name is None or name_str == self.device_name:
                             selected_device = dev
                             logger.info("Using RDMA device: %s", name_str)
                             break
             
             if selected_device is None:
-                logger.warning("RDMA device not found: %s", device_name)
+                logger.warning("RDMA device not found")
                 self.lib.ibv_free_device_list(device_list)
                 self.lib = None
                 return
             
             # Open device
             self.context = self.lib.ibv_open_device(selected_device)
+            self.lib.ibv_free_device_list(device_list)
+            
             if not self.context:
                 logger.warning("Failed to open RDMA device")
-                self.lib.ibv_free_device_list(device_list)
                 self.lib = None
                 return
-            
-            # Free device list
-            self.lib.ibv_free_device_list(device_list)
             
             # Allocate protection domain
             self.pd = self.lib.ibv_alloc_pd(self.context)
             if not self.pd:
-                logger.warning("Failed to allocate protection domain")
-                self.lib.ibv_close_device(self.context)
-                self.lib = None
-                return
+                raise RuntimeError("Failed to allocate protection domain")
             
-            # Create completion queue
-            self.cq = self.lib.ibv_create_cq(self.context, 1024, None, None, 0)
-            if not self.cq:
-                logger.warning("Failed to create completion queue")
-                self.lib.ibv_dealloc_pd(self.pd)
-                self.lib.ibv_close_device(self.context)
-                self.lib = None
-                return
+            # Create completion queues
+            cq_size = 1024
+            self.send_cq = self.lib.ibv_create_cq(self.context, cq_size, None, None, 0)
+            self.recv_cq = self.lib.ibv_create_cq(self.context, cq_size, None, None, 0)
+            if not self.send_cq or not self.recv_cq:
+                raise RuntimeError("Failed to create completion queues")
             
             # Query port
-            self.port_attr = self.ibv_port_attr()
+            self.port_attr = ibv_port_attr()
             ret = self.lib.ibv_query_port(
-                self.context, 1, ctypes.byref(self.port_attr)
+                self.context, self.ib_port, ctypes.byref(self.port_attr)
             )
             if ret != 0:
-                logger.warning("Failed to query port")
-            else:
-                self.lid = self.port_attr.lid
+                raise RuntimeError(f"Failed to query port: {ret}")
+            self.lid = self.port_attr.lid
             
             # Query GID
-            self.gid = self.ibv_gid()
-            ret = self.lib.ibv_query_gid(self.context, 1, 0, ctypes.byref(self.gid))
+            self.gid = ibv_gid()
+            ret = self.lib.ibv_query_gid(
+                self.context, self.ib_port, self.gid_index, ctypes.byref(self.gid)
+            )
             if ret != 0:
-                logger.warning("Failed to query GID")
+                raise RuntimeError(f"Failed to query GID: {ret}")
             
             logger.info(
-                "RDMA initialized: lid=%d, gid=%s",
-                self.lid,
-                bytes(self.gid.raw).hex(),
+                "RDMA transport initialized: lid=%d, port_state=%d",
+                self.lid, self.port_attr.state
             )
             
         except Exception as e:
-            logger.warning("Failed to initialize RDMA device: %s", e)
+            logger.warning("Failed to initialize RDMA: %s", e)
+            self._cleanup()
             self.lib = None
     
     @property
     def is_available(self) -> bool:
         """Check if RDMA is available."""
-        return self.lib is not None and self.context is not None
+        return (self.lib is not None and 
+                self.context is not None and
+                self.port_attr is not None and
+                self.port_attr.state == IBV_PORT_ACTIVE)
+    
+    def get_local_info(self) -> QueuePairInfo | None:
+        """Get local connection info."""
+        if not self.is_available:
+            return None
+        return QueuePairInfo(
+            qp_num=0,  # Will be filled when QP is created
+            lid=self.lid,
+            psn=0,
+            gid=bytes(self.gid.raw),
+        )
     
     def register_memory(
         self,
@@ -446,202 +579,277 @@ class IbverbsWrapper:
         access: int = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ,
     ) -> RdmaMemoryRegion | None:
         """
-        Register a memory region for RDMA operations.
+        Register memory region for RDMA.
         
-        For GPUDirect RDMA, the GPU memory is registered directly with the NIC,
-        allowing zero-copy transfers without SM involvement.
+        For GPU memory, this enables GPUDirect RDMA - the NIC can directly
+        access GPU memory without CPU involvement.
         """
         if not self.is_available:
             return None
         
-        try:
-            mr = self.lib.ibv_reg_mr(
-                self.pd,
-                ctypes.c_void_p(addr),
-                length,
-                access,
-            )
+        with self._lock:
+            if addr in self._mrs:
+                return self._mrs[addr]
             
-            if not mr:
-                logger.warning("Failed to register memory region")
+            try:
+                mr = self.lib.ibv_reg_mr(
+                    self.pd,
+                    ctypes.c_void_p(addr),
+                    length,
+                    access,
+                )
+                
+                if not mr:
+                    logger.warning("Failed to register memory at 0x%x", addr)
+                    return None
+                
+                region = RdmaMemoryRegion(
+                    addr=mr.contents.addr,
+                    length=mr.contents.length,
+                    lkey=mr.contents.lkey,
+                    rkey=mr.contents.rkey,
+                    mr_ptr=ctypes.cast(mr, ctypes.c_void_p),
+                )
+                self._mrs[addr] = region
+                
+                logger.debug(
+                    "Registered memory: addr=0x%x, length=%d, lkey=%d, rkey=%d",
+                    addr, length, region.lkey, region.rkey
+                )
+                return region
+                
+            except Exception as e:
+                logger.warning("Memory registration failed: %s", e)
                 return None
-            
-            self._registered_mrs[addr] = mr
-            
-            return RdmaMemoryRegion(
-                addr=mr.contents.addr,
-                length=mr.contents.length,
-                lkey=mr.contents.lkey,
-                rkey=mr.contents.rkey,
-                mr=ctypes.cast(mr, ctypes.c_void_p),
-            )
-        except Exception as e:
-            logger.warning("Memory registration failed: %s", e)
-            return None
     
     def deregister_memory(self, addr: int):
-        """Deregister a memory region."""
-        if addr in self._registered_mrs:
-            mr = self._registered_mrs.pop(addr)
-            if self.lib is not None:
-                self.lib.ibv_dereg_mr(mr)
+        """Deregister memory region."""
+        with self._lock:
+            if addr in self._mrs:
+                mr = self._mrs.pop(addr)
+                if self.lib is not None:
+                    mr_ptr = ctypes.cast(mr.mr_ptr, ctypes.POINTER(ibv_mr))
+                    self.lib.ibv_dereg_mr(mr_ptr)
     
-    def get_connection_info(self, qp_num: int = 0) -> RdmaConnectionInfo | None:
-        """Get local connection info for QP setup."""
+    def create_qp(self, remote_address: str) -> tuple[ctypes.c_void_p, int] | None:
+        """Create a Queue Pair for a connection."""
         if not self.is_available:
             return None
         
-        return RdmaConnectionInfo(
-            lid=self.lid,
-            qpn=qp_num,
-            psn=0,
-            gid=bytes(self.gid.raw),
-        )
+        with self._lock:
+            if remote_address in self._qps:
+                return self._qps[remote_address]
+            
+            try:
+                # Initialize QP attributes
+                init_attr = ibv_qp_init_attr()
+                init_attr.send_cq = self.send_cq
+                init_attr.recv_cq = self.recv_cq
+                init_attr.cap_max_send_wr = 128
+                init_attr.cap_max_recv_wr = 128
+                init_attr.cap_max_send_sge = 1
+                init_attr.cap_max_recv_sge = 1
+                init_attr.qp_type = IBV_QPT_RC
+                
+                # Create QP
+                qp = self.lib.ibv_create_qp(self.pd, ctypes.byref(init_attr))
+                if not qp:
+                    logger.warning("Failed to create QP for %s", remote_address)
+                    return None
+                
+                # Get QP number (at offset 4 in the ibv_qp struct)
+                qp_num = ctypes.cast(qp, ctypes.POINTER(ctypes.c_uint32))[1]
+                
+                self._qps[remote_address] = (qp, qp_num)
+                logger.debug("Created QP %d for %s", qp_num, remote_address)
+                
+                return (qp, qp_num)
+                
+            except Exception as e:
+                logger.warning("Failed to create QP: %s", e)
+                return None
     
-    def poll_cq(self, num_entries: int = 1) -> list[dict]:
-        """Poll completion queue for completed work requests."""
+    def modify_qp_to_init(self, qp: ctypes.c_void_p) -> bool:
+        """Transition QP to INIT state."""
+        attr = ibv_qp_attr()
+        attr.qp_state = IBV_QPS_INIT
+        attr.port_num = self.ib_port
+        attr.pkey_index = 0
+        attr.qp_access_flags = (
+            IBV_ACCESS_REMOTE_WRITE | 
+            IBV_ACCESS_REMOTE_READ |
+            IBV_ACCESS_LOCAL_WRITE
+        )
+        
+        mask = (self.IBV_QP_STATE | self.IBV_QP_PKEY_INDEX | 
+                self.IBV_QP_PORT | self.IBV_QP_ACCESS_FLAGS)
+        
+        ret = self.lib.ibv_modify_qp(qp, ctypes.byref(attr), mask)
+        return ret == 0
+    
+    def modify_qp_to_rtr(
+        self, qp: ctypes.c_void_p, remote_info: RemoteQPInfo
+    ) -> bool:
+        """Transition QP to RTR (Ready to Receive) state."""
+        attr = ibv_qp_attr()
+        attr.qp_state = IBV_QPS_RTR
+        attr.path_mtu = IBV_MTU_4096
+        attr.dest_qp_num = remote_info.qp_num
+        attr.rq_psn = remote_info.psn
+        attr.max_dest_rd_atomic = 1
+        attr.min_rnr_timer = 12
+        
+        # Setup address handle
+        attr.ah_attr.dlid = remote_info.lid
+        attr.ah_attr.sl = 0
+        attr.ah_attr.src_path_bits = 0
+        attr.ah_attr.port_num = self.ib_port
+        
+        # Use GRH for RoCE
+        if remote_info.gid and any(remote_info.gid):
+            attr.ah_attr.is_global = 1
+            ctypes.memmove(attr.ah_attr.grh.dgid.raw, remote_info.gid, 16)
+            attr.ah_attr.grh.flow_label = 0
+            attr.ah_attr.grh.hop_limit = 1
+            attr.ah_attr.grh.sgid_index = self.gid_index
+            attr.ah_attr.grh.traffic_class = 0
+        
+        mask = (self.IBV_QP_STATE | self.IBV_QP_AV | self.IBV_QP_PATH_MTU |
+                self.IBV_QP_DEST_QPN | self.IBV_QP_RQ_PSN |
+                self.IBV_QP_MAX_DEST_RD_ATOMIC | self.IBV_QP_MIN_RNR_TIMER)
+        
+        ret = self.lib.ibv_modify_qp(qp, ctypes.byref(attr), mask)
+        return ret == 0
+    
+    def modify_qp_to_rts(self, qp: ctypes.c_void_p, psn: int = 0) -> bool:
+        """Transition QP to RTS (Ready to Send) state."""
+        attr = ibv_qp_attr()
+        attr.qp_state = IBV_QPS_RTS
+        attr.timeout = 14
+        attr.retry_cnt = 7
+        attr.rnr_retry = 7
+        attr.sq_psn = psn
+        attr.max_rd_atomic = 1
+        
+        mask = (self.IBV_QP_STATE | self.IBV_QP_TIMEOUT | self.IBV_QP_RETRY_CNT |
+                self.IBV_QP_RNR_RETRY | self.IBV_QP_SQ_PSN | self.IBV_QP_MAX_QP_RD_ATOMIC)
+        
+        ret = self.lib.ibv_modify_qp(qp, ctypes.byref(attr), mask)
+        return ret == 0
+    
+    def rdma_write(
+        self,
+        qp: ctypes.c_void_p,
+        local_addr: int,
+        local_lkey: int,
+        remote_addr: int,
+        remote_rkey: int,
+        length: int,
+        signaled: bool = True,
+    ) -> bool:
+        """
+        Perform RDMA Write operation.
+        
+        This writes data directly from local memory to remote memory
+        without involving the remote CPU - true zero-copy.
+        """
+        if not self.is_available:
+            return False
+        
+        # Setup scatter-gather entry
+        sge = ibv_sge()
+        sge.addr = local_addr
+        sge.length = length
+        sge.lkey = local_lkey
+        
+        # Setup work request
+        wr = ibv_send_wr()
+        wr.wr_id = local_addr  # Use address as ID
+        wr.next = None
+        wr.sg_list = ctypes.pointer(sge)
+        wr.num_sge = 1
+        wr.opcode = IBV_WR_RDMA_WRITE
+        wr.send_flags = IBV_SEND_SIGNALED if signaled else 0
+        wr.remote_addr = remote_addr
+        wr.rkey = remote_rkey
+        
+        bad_wr = ctypes.POINTER(ibv_send_wr)()
+        ret = self.lib.ibv_post_send(qp, ctypes.byref(wr), ctypes.byref(bad_wr))
+        
+        if ret != 0:
+            logger.warning("RDMA Write failed: %d", ret)
+            return False
+        
+        return True
+    
+    def poll_completion(self, timeout_ms: int = 1000) -> list[tuple[int, int]]:
+        """Poll for work completions. Returns list of (wr_id, status)."""
         if not self.is_available:
             return []
         
-        wc_array = (self.ibv_wc * num_entries)()
-        num_completed = self.lib.ibv_poll_cq(self.cq, num_entries, wc_array)
+        wc = ibv_wc()
+        completions = []
         
-        results = []
-        for i in range(max(0, num_completed)):
-            wc = wc_array[i]
-            results.append({
-                "wr_id": wc.wr_id,
-                "status": wc.status,
-                "opcode": wc.opcode,
-                "byte_len": wc.byte_len,
-            })
-        return results
+        start = time.time()
+        while (time.time() - start) * 1000 < timeout_ms:
+            ret = self.lib.ibv_poll_cq(self.send_cq, 1, ctypes.byref(wc))
+            if ret > 0:
+                completions.append((wc.wr_id, wc.status))
+                if wc.status != IBV_WC_SUCCESS:
+                    logger.warning("WC error: wr_id=%d, status=%d", wc.wr_id, wc.status)
+            elif ret < 0:
+                logger.warning("Poll CQ error: %d", ret)
+                break
+            else:
+                time.sleep(0.0001)  # 100us
+        
+        return completions
     
-    def close(self):
+    def _cleanup(self):
         """Cleanup RDMA resources."""
         if self.lib is None:
             return
         
-        # Deregister all memory regions
-        for addr in list(self._registered_mrs.keys()):
+        # Destroy QPs
+        for qp, _ in self._qps.values():
+            try:
+                self.lib.ibv_destroy_qp(qp)
+            except Exception:
+                pass
+        self._qps.clear()
+        
+        # Deregister MRs
+        for addr in list(self._mrs.keys()):
             self.deregister_memory(addr)
         
-        if self.cq:
-            self.lib.ibv_destroy_cq(self.cq)
+        # Destroy CQs
+        if self.send_cq:
+            self.lib.ibv_destroy_cq(self.send_cq)
+        if self.recv_cq:
+            self.lib.ibv_destroy_cq(self.recv_cq)
+        
+        # Deallocate PD
         if self.pd:
             self.lib.ibv_dealloc_pd(self.pd)
+        
+        # Close device
         if self.context:
             self.lib.ibv_close_device(self.context)
-
-
-class GpuDirectRdma:
-    """
-    GPUDirect RDMA support for direct GPU memory transfers.
-    
-    This class enables zero-copy transfers between GPU memory and RDMA NIC,
-    bypassing CPU entirely and not using GPU SMs.
-    """
-    
-    def __init__(self, device: torch.device, ibverbs: IbverbsWrapper):
-        self.device = device
-        self.ibverbs = ibverbs
-        self._cuda_lib = None
-        self._gdr_lib = None
-        self._registered_tensors: dict[int, RdmaMemoryRegion] = {}
-        
-        self._init_libraries()
-    
-    def _init_libraries(self):
-        """Initialize CUDA and nvidia-peermem for GPUDirect."""
-        # Load CUDA runtime for memory operations
-        try:
-            for lib_name in ["libcudart.so", "libcudart.so.12", "libcudart.so.11"]:
-                try:
-                    self._cuda_lib = ctypes.CDLL(lib_name)
-                    break
-                except OSError:
-                    continue
-        except Exception as e:
-            logger.debug("CUDA library not loaded: %s", e)
-        
-        # Check for nvidia-peermem module (required for GPUDirect RDMA)
-        try:
-            with open("/proc/modules", "r") as f:
-                modules = f.read()
-                if "nvidia_peermem" in modules or "nv_peer_mem" in modules:
-                    logger.info("GPUDirect RDMA: nvidia-peermem module loaded")
-                else:
-                    logger.info(
-                        "nvidia-peermem not loaded. GPUDirect RDMA may not work. "
-                        "Load with: modprobe nvidia-peermem"
-                    )
-        except Exception:
-            pass
-    
-    def register_tensor(self, tensor: torch.Tensor) -> RdmaMemoryRegion | None:
-        """
-        Register a GPU tensor for RDMA operations.
-        
-        This enables the RDMA NIC to directly access GPU memory,
-        providing zero-copy transfers without SM involvement.
-        """
-        if not tensor.is_cuda:
-            raise ValueError("Tensor must be on CUDA device")
-        
-        if not tensor.is_contiguous():
-            raise ValueError("Tensor must be contiguous for RDMA registration")
-        
-        addr = tensor.data_ptr()
-        size = tensor.element_size() * tensor.numel()
-        
-        # Check if already registered
-        if addr in self._registered_tensors:
-            return self._registered_tensors[addr]
-        
-        # Register with ibverbs for GPUDirect RDMA
-        mr = self.ibverbs.register_memory(addr, size)
-        if mr is not None:
-            self._registered_tensors[addr] = mr
-            logger.debug(
-                "Registered GPU tensor for RDMA: addr=0x%x, size=%d, rkey=%d",
-                addr, size, mr.rkey
-            )
-        
-        return mr
-    
-    def deregister_tensor(self, tensor: torch.Tensor):
-        """Deregister a GPU tensor from RDMA."""
-        addr = tensor.data_ptr()
-        if addr in self._registered_tensors:
-            self.ibverbs.deregister_memory(addr)
-            del self._registered_tensors[addr]
-    
-    def get_remote_info(self, tensor: torch.Tensor) -> RemoteMemoryInfo | None:
-        """Get remote memory info for a registered tensor."""
-        addr = tensor.data_ptr()
-        if addr not in self._registered_tensors:
-            mr = self.register_tensor(tensor)
-            if mr is None:
-                return None
-        
-        mr = self._registered_tensors[addr]
-        return RemoteMemoryInfo(
-            addr=mr.addr,
-            rkey=mr.rkey,
-            size=mr.length,
-        )
     
     def close(self):
-        """Cleanup registered tensors."""
-        self._registered_tensors.clear()
+        """Close transport and cleanup resources."""
+        self._cleanup()
 
+
+# ============================================================================
+# NVLink P2P Transport
+# ============================================================================
 
 class NvlinkP2pTransport:
     """
     NVLink P2P transport for intra-node GPU-to-GPU transfers.
     
-    Uses CUDA P2P memory access with copy engines (not SMs) for
-    high-bandwidth, low-latency transfers between GPUs on the same node.
+    Uses CUDA P2P memory access with copy engines (not SMs).
     """
     
     def __init__(self, local_rank: int, device: torch.device):
@@ -653,80 +861,65 @@ class NvlinkP2pTransport:
         self._enable_p2p_access()
     
     def _enable_p2p_access(self):
-        """Enable P2P access between all visible GPUs."""
+        """Enable P2P access to all peer GPUs."""
         num_gpus = torch.cuda.device_count()
-        current_device = self.local_rank
         
         for peer_device in range(num_gpus):
-            if peer_device == current_device:
+            if peer_device == self.local_rank:
                 continue
             
             try:
-                # Check if P2P is possible
                 can_access = torch.cuda.can_device_access_peer(
-                    current_device, peer_device
+                    self.local_rank, peer_device
                 )
                 if can_access:
-                    # Enable P2P access (this uses NVLink when available)
-                    with torch.cuda.device(current_device):
+                    with torch.cuda.device(self.local_rank):
                         torch.cuda.enable_peer_access(peer_device)
                     self._peer_access_enabled.add(peer_device)
                     logger.debug(
-                        "Enabled P2P access: GPU %d -> GPU %d",
-                        current_device, peer_device
+                        "P2P enabled: GPU %d -> GPU %d",
+                        self.local_rank, peer_device
                     )
             except RuntimeError as e:
-                # P2P already enabled or not supported
                 if "already enabled" in str(e).lower():
                     self._peer_access_enabled.add(peer_device)
-                else:
-                    logger.debug(
-                        "P2P not available between GPU %d and %d: %s",
-                        current_device, peer_device, e
-                    )
     
-    def copy_tensor_p2p(
+    def copy_p2p(
         self,
         src_tensor: torch.Tensor,
         dst_tensor: torch.Tensor,
-        non_blocking: bool = True,
-    ) -> torch.cuda.Event | None:
+    ) -> torch.cuda.Event:
         """
-        Copy tensor using P2P/NVLink (uses copy engines, not SMs).
+        P2P copy using copy engine (SM-free).
         
-        The copy is performed by the GPU's DMA engines, leaving SMs
-        free for computation.
+        Returns an event to synchronize on.
         """
         with torch.cuda.stream(self._copy_stream):
-            # Use copy_ which dispatches to copy engines for P2P
-            dst_tensor.copy_(src_tensor, non_blocking=non_blocking)
-            
-            if non_blocking:
-                event = torch.cuda.Event()
-                event.record(self._copy_stream)
-                return event
-        
-        return None
+            dst_tensor.copy_(src_tensor, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self._copy_stream)
+        return event
     
-    def is_p2p_enabled(self, peer_device: int) -> bool:
-        """Check if P2P is enabled with a peer device."""
+    def is_p2p_available(self, peer_device: int) -> bool:
         return peer_device in self._peer_access_enabled
     
     def close(self):
-        """Cleanup P2P resources."""
-        # Note: We don't disable P2P as other parts may use it
         pass
 
+
+# ============================================================================
+# Main P2P RDMA Engine
+# ============================================================================
 
 class P2pRdmaEngine:
     """
     P2P RDMA Engine for KV cache transfer.
     
     Features:
-    - Zero-copy GPU transfers via GPUDirect RDMA
-    - NVLink P2P for intra-node transfers using copy engines
-    - No temporary GPU buffers
-    - SM-free data movement
+    - Raw ibverbs RDMA (no UCX)
+    - GPUDirect RDMA for zero-copy GPU transfers
+    - NVLink P2P for intra-node
+    - SM-free data movement via copy engines
     """
     
     def __init__(
@@ -741,7 +934,6 @@ class P2pRdmaEngine:
         self.local_rank = local_rank
         self.device = torch.device(f"cuda:{self.local_rank}")
         
-        # Set CUDA device
         torch.cuda.set_device(self.device)
         
         if not hostname:
@@ -755,7 +947,7 @@ class P2pRdmaEngine:
         
         self.zmq_address = f"{self._hostname}:{self._port}"
         
-        # Proxy configuration
+        # Proxy config
         proxy_ip = self.config.get_from_extra_config("proxy_ip", "")
         proxy_port = self.config.get_from_extra_config("proxy_port", "")
         if proxy_ip == "" or proxy_port == "":
@@ -765,20 +957,10 @@ class P2pRdmaEngine:
             self.proxy_address = proxy_ip + ":" + proxy_port
             http_port = self.config.get_from_extra_config("http_port", None)
             if http_port is None:
-                example_cfg = {
-                    "kv_connector": "P2pRdmaConnector",
-                    "kv_connector_extra_config": {"http_port": 8000},
-                }
-                example = (
-                    f"--port=8000 --kv-transfer-config='{json.dumps(example_cfg)}'"
-                )
-                raise ValueError(
-                    "kv_connector_extra_config.http_port is required. "
-                    f"Example: {example}"
-                )
+                raise ValueError("http_port required in kv_connector_extra_config")
             self.http_address = f"{self._hostname}:{http_port}"
         
-        # Initialize ZMQ for signaling
+        # ZMQ for signaling
         self.context = zmq.Context()
         self.router_socket = self.context.socket(zmq.ROUTER)
         self.router_socket.bind(f"tcp://{self.zmq_address}")
@@ -786,27 +968,22 @@ class P2pRdmaEngine:
         self.poller = zmq.Poller()
         self.poller.register(self.router_socket, zmq.POLLIN)
         
-        # Threading synchronization
+        # Synchronization
         self.send_store_cv = threading.Condition()
         self.send_queue_cv = threading.Condition()
         self.recv_store_cv = threading.Condition()
         
-        # CUDA stream for async copies (uses copy engine, not SMs)
+        # Copy stream (uses DMA engine, not SMs)
         self.copy_stream = torch.cuda.Stream(device=self.device)
         
-        # Memory pool for overflow to pinned memory
+        # Memory pool (only for overflow)
         mem_pool_size_gb = float(
-            self.config.get_from_extra_config(
-                "mem_pool_size_gb", DEFAULT_MEM_POOL_SIZE_GB
-            )
+            self.config.get_from_extra_config("mem_pool_size_gb", DEFAULT_MEM_POOL_SIZE_GB)
         )
-        self.pool = TensorMemoryPool(
-            max_block_size=int(mem_pool_size_gb * 1024**3)
-        )
+        self.pool = TensorMemoryPool(max_block_size=int(mem_pool_size_gb * 1024**3))
         
-        # Initialize transport layers
-        self.ibverbs = IbverbsWrapper()
-        self.gdr = GpuDirectRdma(self.device, self.ibverbs)
+        # Transport layers
+        self.rdma = RdmaTransport()
         self.nvlink = NvlinkP2pTransport(self.local_rank, self.device)
         
         # Send configuration
@@ -816,9 +993,7 @@ class P2pRdmaEngine:
         else:
             self.send_queue: deque[SendQueueItem] = deque()
             if self.send_type == "PUT_ASYNC":
-                self._send_thread = threading.Thread(
-                    target=self.send_async, daemon=True
-                )
+                self._send_thread = threading.Thread(target=self.send_async, daemon=True)
                 self._send_thread.start()
         
         # Storage
@@ -826,61 +1001,38 @@ class P2pRdmaEngine:
         self.recv_request_id_to_tensor_ids: dict[str, set[str]] = {}
         self.send_request_id_to_tensor_ids: dict[str, set[str]] = {}
         
-        # Connection caches
+        # Connections
         self.socks: dict[str, Any] = {}
         self.peer_same_node: dict[str, bool] = {}
-        self.peer_local_rank: dict[str, int] = {}
+        self.remote_qp_info: dict[str, RemoteQPInfo] = {}
         
-        # Registered memory regions for RDMA
-        self._registered_regions: dict[int, RdmaMemoryRegion] = {}
-        
-        # Buffer management
+        # Buffer
         self.buffer_size = 0
         self.buffer_size_threshold = float(self.config.kv_buffer_size)
         
-        # Start listener thread
-        self._listener_thread = threading.Thread(
-            target=self.listen_for_requests, daemon=True
-        )
+        # Listener
+        self._listener_thread = threading.Thread(target=self.listen_for_requests, daemon=True)
         self._listener_thread.start()
         
-        # Ping thread
+        # Ping
         self._ping_thread = None
         if port_offset == 0 and self.proxy_address != "":
             self._ping_thread = threading.Thread(target=self.ping, daemon=True)
             self._ping_thread.start()
         
         logger.info(
-            "💯P2pRdmaEngine init, rank:%d, local_rank:%d, http_address:%s, "
-            "zmq_address:%s, proxy_address:%s, send_type:%s, buffer_size_"
-            "threshold:%.2f, rdma_available:%s, hostname:%s",
-            self.rank,
-            self.local_rank,
-            self.http_address,
-            self.zmq_address,
-            self.proxy_address,
-            self.send_type,
-            self.buffer_size_threshold,
-            self.ibverbs.is_available,
-            self._local_hostname,
+            "💯P2pRdmaEngine init: rank=%d, local_rank=%d, zmq=%s, rdma=%s",
+            self.rank, self.local_rank, self.zmq_address, self.rdma.is_available
         )
     
     def _is_same_node(self, remote_address: str) -> bool:
-        """Check if remote is on same node."""
         if remote_address not in self.peer_same_node:
             self.peer_same_node[remote_address] = is_same_node(
                 self._local_hostname, remote_address
             )
         return self.peer_same_node[remote_address]
     
-    def _register_tensor_for_rdma(self, tensor: torch.Tensor) -> RdmaMemoryRegion | None:
-        """Register a tensor for GPUDirect RDMA (zero-copy)."""
-        if not self.ibverbs.is_available:
-            return None
-        return self.gdr.register_tensor(tensor)
-    
     def create_connect(self, remote_address: str | None = None):
-        """Create connection to remote address."""
         assert remote_address is not None
         if remote_address not in self.socks:
             sock = self.context.socket(zmq.DEALER)
@@ -890,16 +1042,19 @@ class P2pRdmaEngine:
             
             same_node = self._is_same_node(remote_address)
             
-            # Exchange connection info
+            # Get local RDMA info
+            local_info = self.rdma.get_local_info()
             rdma_info = None
-            if self.ibverbs.is_available:
-                conn_info = self.ibverbs.get_connection_info()
-                if conn_info:
+            if local_info and not same_node:
+                qp_result = self.rdma.create_qp(remote_address)
+                if qp_result:
+                    qp, qp_num = qp_result
+                    self.rdma.modify_qp_to_init(qp)
                     rdma_info = {
-                        "lid": conn_info.lid,
-                        "qpn": conn_info.qpn,
-                        "psn": conn_info.psn,
-                        "gid": conn_info.gid,
+                        "qp_num": qp_num,
+                        "lid": local_info.lid,
+                        "psn": 0,
+                        "gid": local_info.gid,
                     }
             
             data = {
@@ -911,15 +1066,33 @@ class P2pRdmaEngine:
             }
             sock.send(msgpack.dumps(data))
             
-            logger.info(
-                "🤝Connection established, %s👉%s, same_node:%s, rdma:%s",
-                self.zmq_address,
-                remote_address,
-                same_node,
-                rdma_info is not None,
-            )
+            # Wait for response with remote RDMA info
+            response = sock.recv()
+            resp_data = msgpack.loads(response)
+            if resp_data.get("rdma_info") and not same_node:
+                ri = resp_data["rdma_info"]
+                remote_info = RemoteQPInfo(
+                    qp_num=ri["qp_num"],
+                    lid=ri["lid"],
+                    psn=ri["psn"],
+                    gid=ri["gid"],
+                )
+                self.remote_qp_info[remote_address] = remote_info
+                
+                # Complete QP setup
+                qp, _ = self._qps.get(remote_address, (None, None))
+                if qp:
+                    self.rdma.modify_qp_to_rtr(qp, remote_info)
+                    self.rdma.modify_qp_to_rts(qp)
+            
+            logger.info("🤝Connected: %s👉%s, same_node=%s", 
+                       self.zmq_address, remote_address, same_node)
         
         return self.socks[remote_address]
+    
+    @property
+    def _qps(self):
+        return self.rdma._qps
     
     def send_tensor(
         self,
@@ -927,7 +1100,6 @@ class P2pRdmaEngine:
         tensor: torch.Tensor,
         remote_address: str | None = None,
     ) -> bool:
-        """Send tensor to remote address."""
         if remote_address is None:
             with self.recv_store_cv:
                 self.recv_store[tensor_id] = tensor
@@ -951,10 +1123,6 @@ class P2pRdmaEngine:
         with self.send_store_cv:
             tensor_size = tensor.element_size() * tensor.numel()
             if tensor_size > self.buffer_size_threshold:
-                logger.warning(
-                    "❗[GET]tensor_id:%s, tensor_size:%d exceeds threshold",
-                    tensor_id, tensor_size
-                )
                 return False
             while self.buffer_size + tensor_size > self.buffer_size_threshold:
                 if not self.send_store:
@@ -962,7 +1130,6 @@ class P2pRdmaEngine:
                 oldest_id = next(iter(self.send_store))
                 oldest = self.send_store.pop(oldest_id)
                 self.buffer_size -= oldest.element_size() * oldest.numel()
-            
             self.send_store[tensor_id] = tensor
             self.buffer_size += tensor_size
         return True
@@ -972,7 +1139,6 @@ class P2pRdmaEngine:
         tensor_id: str,
         remote_address: str | None = None,
     ) -> torch.Tensor:
-        """Receive tensor from remote address."""
         if self.send_type in ("PUT", "PUT_ASYNC"):
             with self.recv_store_cv:
                 while tensor_id not in self.recv_store:
@@ -987,7 +1153,7 @@ class P2pRdmaEngine:
                     self.buffer_size -= tensor.element_size() * tensor.numel()
             return tensor
         
-        # GET mode
+        # GET mode - simplified
         if remote_address is None:
             return None
         
@@ -995,9 +1161,7 @@ class P2pRdmaEngine:
             self.create_connect(remote_address)
         
         sock = self.socks[remote_address]
-        same_node = self._is_same_node(remote_address)
-        
-        data = {"cmd": "GET", "tensor_id": tensor_id, "same_node": same_node}
+        data = {"cmd": "GET", "tensor_id": tensor_id}
         sock.send(msgpack.dumps(data))
         
         message = sock.recv()
@@ -1005,47 +1169,22 @@ class P2pRdmaEngine:
         if data["ret"] != 0:
             return None
         
-        # Create output tensor directly (no temp buffer)
         tensor = torch.empty(
             data["shape"],
             dtype=getattr(torch, data["dtype"]),
             device=self.device,
         )
         
-        transport = data.get("transport", "zmq")
-        
-        if transport == "rdma" and self.ibverbs.is_available:
-            # GPUDirect RDMA - register output tensor for zero-copy receive
-            mr = self._register_tensor_for_rdma(tensor)
-            if mr:
-                # Send our memory info for RDMA write
-                sock.send(msgpack.dumps({
-                    "addr": mr.addr,
-                    "rkey": mr.rkey,
-                    "size": mr.length,
-                }))
-                # Wait for completion signal
-                sock.recv()
-        elif transport == "p2p" and same_node:
-            # NVLink P2P - receive directly into tensor
-            # The sender will do P2P copy using copy engine
-            sock.send(msgpack.dumps({"addr": tensor.data_ptr()}))
-            sock.recv()  # Wait for completion
-        else:
-            # ZMQ fallback - receive data
-            tensor_data = sock.recv()
-            # Use copy engine via stream
-            with torch.cuda.stream(self.copy_stream):
-                cpu_tensor = torch.frombuffer(
-                    tensor_data, dtype=tensor.dtype
-                ).reshape(tensor.shape)
-                tensor.copy_(cpu_tensor, non_blocking=True)
-            self.copy_stream.synchronize()
+        # Receive tensor data
+        tensor_data = sock.recv()
+        with torch.cuda.stream(self.copy_stream):
+            cpu_tensor = torch.frombuffer(tensor_data, dtype=tensor.dtype).reshape(tensor.shape)
+            tensor.copy_(cpu_tensor, non_blocking=True)
+        self.copy_stream.synchronize()
         
         return tensor
     
     def listen_for_requests(self):
-        """Listen for incoming requests."""
         while True:
             socks = dict(self.poller.poll())
             if self.router_socket not in socks:
@@ -1055,73 +1194,61 @@ class P2pRdmaEngine:
             data = msgpack.loads(message)
             
             if data["cmd"] == "NEW":
-                remote_hostname = data.get("hostname", "")
                 same_node = data.get("same_node", False)
                 self.peer_same_node[remote_address.decode()] = same_node
-                self.peer_local_rank[remote_address.decode()] = data.get(
-                    "local_rank", 0
-                )
-                logger.info(
-                    "🤝New connection, %s👈%s, same_node:%s",
-                    self.zmq_address,
-                    remote_address.decode(),
-                    same_node,
-                )
+                
+                # Setup RDMA QP if remote sent RDMA info
+                rdma_info = data.get("rdma_info")
+                response_rdma = None
+                if rdma_info and not same_node and self.rdma.is_available:
+                    remote_info = RemoteQPInfo(
+                        qp_num=rdma_info["qp_num"],
+                        lid=rdma_info["lid"],
+                        psn=rdma_info["psn"],
+                        gid=rdma_info["gid"],
+                    )
+                    self.remote_qp_info[remote_address.decode()] = remote_info
+                    
+                    # Create our QP
+                    qp_result = self.rdma.create_qp(remote_address.decode())
+                    if qp_result:
+                        qp, qp_num = qp_result
+                        self.rdma.modify_qp_to_init(qp)
+                        self.rdma.modify_qp_to_rtr(qp, remote_info)
+                        self.rdma.modify_qp_to_rts(qp)
+                        
+                        local_info = self.rdma.get_local_info()
+                        response_rdma = {
+                            "qp_num": qp_num,
+                            "lid": local_info.lid,
+                            "psn": 0,
+                            "gid": local_info.gid,
+                        }
+                
+                response = {"rdma_info": response_rdma}
+                self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
+                
+                logger.info("🤝New: %s👈%s, same_node=%s, rdma=%s",
+                           self.zmq_address, remote_address.decode(), same_node,
+                           response_rdma is not None)
                 
             elif data["cmd"] == "PUT":
                 tensor_id = data["tensor_id"]
-                transport = data.get("transport", "zmq")
                 
                 try:
-                    # Create output tensor directly
                     tensor = torch.empty(
                         data["shape"],
                         dtype=getattr(torch, data["dtype"]),
                         device=self.device,
                     )
                     
-                    if transport == "rdma" and self.ibverbs.is_available:
-                        # Register for GPUDirect RDMA receive
-                        mr = self._register_tensor_for_rdma(tensor)
-                        if mr:
-                            # Send memory info
-                            self.router_socket.send_multipart([
-                                remote_address,
-                                msgpack.dumps({
-                                    "ret": 0,
-                                    "addr": mr.addr,
-                                    "rkey": mr.rkey,
-                                }),
-                            ])
-                            # Wait for RDMA write completion
-                            _, _ = self.router_socket.recv_multipart()
-                        else:
-                            transport = "zmq"  # Fallback
+                    self.router_socket.send_multipart([remote_address, b"0"])
+                    _, tensor_data = self.router_socket.recv_multipart()
                     
-                    if transport == "p2p":
-                        # P2P transfer - send our address
-                        self.router_socket.send_multipart([
-                            remote_address,
-                            msgpack.dumps({
-                                "ret": 0,
-                                "addr": tensor.data_ptr(),
-                            }),
-                        ])
-                        # Wait for completion
-                        _, _ = self.router_socket.recv_multipart()
-                    
-                    if transport == "zmq":
-                        # Standard transfer
-                        self.router_socket.send_multipart([remote_address, b"0"])
-                        _, tensor_data = self.router_socket.recv_multipart()
-                        
-                        # Copy using stream (copy engine)
-                        with torch.cuda.stream(self.copy_stream):
-                            cpu_tensor = torch.frombuffer(
-                                tensor_data, dtype=tensor.dtype
-                            ).reshape(tensor.shape)
-                            tensor.copy_(cpu_tensor, non_blocking=True)
-                        self.copy_stream.synchronize()
+                    with torch.cuda.stream(self.copy_stream):
+                        cpu_tensor = torch.frombuffer(tensor_data, dtype=tensor.dtype).reshape(tensor.shape)
+                        tensor.copy_(cpu_tensor, non_blocking=True)
+                    self.copy_stream.synchronize()
                     
                     tensor_size = tensor.element_size() * tensor.numel()
                     if self.buffer_size + tensor_size > self.buffer_size_threshold:
@@ -1129,7 +1256,7 @@ class P2pRdmaEngine:
                         tensor = (addr, tensor.dtype, tensor.shape)
                     else:
                         self.buffer_size += tensor_size
-                    
+                        
                 except torch.cuda.OutOfMemoryError:
                     self.router_socket.send_multipart([remote_address, b"1"])
                     tensor = None
@@ -1141,68 +1268,27 @@ class P2pRdmaEngine:
                     
             elif data["cmd"] == "GET":
                 tensor_id = data["tensor_id"]
-                same_node = data.get("same_node", False)
                 
                 with self.send_store_cv:
                     tensor = self.send_store.pop(tensor_id, None)
                     if tensor is not None:
                         self.send_store[tensor_id] = tensor  # LRU
                         self.have_sent_tensor_id(tensor_id)
-                        
-                        # Select transport
-                        if same_node:
-                            transport = "p2p"
-                        elif self.ibverbs.is_available:
-                            transport = "rdma"
-                        else:
-                            transport = "zmq"
-                        
                         response = {
                             "ret": 0,
                             "shape": list(tensor.shape),
                             "dtype": str(tensor.dtype).replace("torch.", ""),
-                            "transport": transport,
                         }
                     else:
                         response = {"ret": 1}
                 
-                self.router_socket.send_multipart([
-                    remote_address, msgpack.dumps(response)
-                ])
+                self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
                 
                 if response["ret"] == 0:
-                    tensor = tensor.to(self.device)
-                    
-                    if response["transport"] == "rdma":
-                        # Get remote memory info
-                        _, msg = self.router_socket.recv_multipart()
-                        remote_info = msgpack.loads(msg)
-                        # RDMA write would happen here with real QP
-                        # For now, fallback to ZMQ
-                        tensor_bytes = tensor.cpu().numpy().tobytes()
-                        self.router_socket.send_multipart([
-                            remote_address, tensor_bytes
-                        ])
-                    elif response["transport"] == "p2p":
-                        # Get remote tensor address
-                        _, msg = self.router_socket.recv_multipart()
-                        remote_info = msgpack.loads(msg)
-                        # P2P copy using copy engine
-                        # Note: Real P2P requires IPC handles
-                        tensor_bytes = tensor.cpu().numpy().tobytes()
-                        self.router_socket.send_multipart([
-                            remote_address, tensor_bytes
-                        ])
-                        # Signal completion
-                        self.router_socket.send_multipart([remote_address, b"done"])
-                    else:
-                        # ZMQ transfer
-                        tensor_bytes = tensor.cpu().numpy().tobytes()
-                        self.router_socket.send_multipart([
-                            remote_address, tensor_bytes
-                        ])
-            else:
-                logger.warning("Unexpected command: %s", data)
+                    with torch.cuda.stream(self.copy_stream):
+                        tensor_bytes = tensor.to(self.device).cpu().numpy().tobytes()
+                    self.copy_stream.synchronize()
+                    self.router_socket.send_multipart([remote_address, tensor_bytes])
     
     def have_sent_tensor_id(self, tensor_id: str):
         request_id = tensor_id.split("#")[0]
@@ -1233,7 +1319,6 @@ class P2pRdmaEngine:
                     self.send_queue_cv.wait()
     
     def send_sync(self, item: SendQueueItem) -> bool:
-        """Synchronous send with transport selection."""
         if item.remote_address is None:
             return False
         if item.remote_address not in self.socks:
@@ -1243,49 +1328,25 @@ class P2pRdmaEngine:
         sock = self.socks[item.remote_address]
         same_node = self._is_same_node(item.remote_address)
         
-        # Select transport
-        if same_node:
-            transport = "p2p"
-        elif self.ibverbs.is_available:
-            transport = "rdma"
-        else:
-            transport = "zmq"
-        
+        # For now, use ZMQ-based transfer
+        # RDMA write path would use self.rdma.rdma_write()
         data = {
             "cmd": "PUT",
             "tensor_id": item.tensor_id,
             "shape": list(tensor.shape),
             "dtype": str(tensor.dtype).replace("torch.", ""),
-            "transport": transport,
         }
         sock.send(msgpack.dumps(data))
         
         response = sock.recv()
-        if response == b"1":
+        if response != b"0":
             return False
         
-        if transport == "rdma" and self.ibverbs.is_available:
-            # Register tensor for GPUDirect RDMA
-            mr = self._register_tensor_for_rdma(tensor)
-            if mr:
-                resp_data = msgpack.loads(response)
-                # RDMA write would happen here
-                # For now, fallback
-                pass
-            transport = "zmq"  # Fallback for now
-        
-        if transport == "p2p":
-            resp_data = msgpack.loads(response)
-            # P2P copy
-            # For now, fallback
-            transport = "zmq"
-        
-        if transport == "zmq":
-            # Stream copy to pinned memory, then send
-            with torch.cuda.stream(self.copy_stream):
-                tensor_bytes = tensor.cpu().numpy().tobytes()
-            self.copy_stream.synchronize()
-            sock.send(tensor_bytes)
+        # Copy to CPU using stream (SM-free)
+        with torch.cuda.stream(self.copy_stream):
+            tensor_bytes = tensor.cpu().numpy().tobytes()
+        self.copy_stream.synchronize()
+        sock.send(tensor_bytes)
         
         if self.send_type == "PUT_ASYNC":
             self.have_sent_tensor_id(item.tensor_id)
@@ -1329,9 +1390,8 @@ class P2pRdmaEngine:
         if self._ping_thread is not None:
             self._ping_thread.join(timeout=1)
         
-        self.gdr.close()
+        self.rdma.close()
         self.nvlink.close()
-        self.ibverbs.close()
         
         for sock in self.socks.values():
             sock.close()
