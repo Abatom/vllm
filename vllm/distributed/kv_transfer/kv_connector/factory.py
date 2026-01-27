@@ -156,6 +156,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "P2pRdmaConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_rdma_connector",
+    "P2pRdmaConnector",
+)
+
+KVConnectorFactory.register_connector(
     "LMCacheConnectorV1",
     "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
     "LMCacheConnectorV1",
