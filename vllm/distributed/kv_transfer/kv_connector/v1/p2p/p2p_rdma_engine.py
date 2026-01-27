@@ -123,6 +123,34 @@ class RdmaMemoryRegion:
 
 
 @dataclass
+class KVCacheMemoryInfo:
+    """
+    Pre-registered KV cache memory information.
+    
+    Registered once at initialization, then used for all transfers
+    by calculating offsets - no per-tensor registration needed.
+    """
+    base_addr: int
+    total_length: int
+    lkey: int
+    rkey: int
+    num_blocks: int
+    block_size_bytes: int  # Size of one block in bytes
+    
+    def get_block_addr(self, block_id: int) -> int:
+        """Get address for a specific block."""
+        return self.base_addr + block_id * self.block_size_bytes
+    
+    def get_tensor_info(self, block_ids: list[int]) -> tuple[int, int]:
+        """Get (start_addr, total_length) for a list of contiguous blocks."""
+        if not block_ids:
+            return (0, 0)
+        start_addr = self.get_block_addr(block_ids[0])
+        total_length = len(block_ids) * self.block_size_bytes
+        return (start_addr, total_length)
+
+
+@dataclass
 class QueuePairInfo:
     """Queue Pair connection information for RDMA."""
     qp_num: int
@@ -1020,10 +1048,176 @@ class P2pRdmaEngine:
             self._ping_thread = threading.Thread(target=self.ping, daemon=True)
             self._ping_thread.start()
         
+        # Pre-registered KV cache memory (registered once, used for all transfers)
+        # layer_name -> KVCacheMemoryInfo
+        self.kv_cache_registry: dict[str, KVCacheMemoryInfo] = {}
+        # All registered base addresses for exchange with remote
+        self.kv_caches_base_addr: list[int] = []
+        self.kv_caches_rkeys: list[int] = []
+        self.block_size = 0
+        self.num_blocks = 0
+        self.block_len = 0  # Size of one block in bytes
+        
         logger.info(
             "💯P2pRdmaEngine init: rank=%d, local_rank=%d, zmq=%s, rdma=%s",
             self.rank, self.local_rank, self.zmq_address, self.rdma.is_available
         )
+    
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """
+        Register all KV cache memory regions once at initialization.
+        
+        This is called once when the model is loaded. After registration,
+        individual tensor transfers use offsets into these pre-registered
+        regions - no per-tensor registration needed.
+        
+        Similar to Mooncake's register_kv_caches() approach.
+        
+        Args:
+            kv_caches: Dict mapping layer names to KV cache tensors
+        """
+        logger.info("Registering KV caches for RDMA (one-time registration)")
+        
+        seen_base_addresses: set[int] = set()
+        tensor_size_bytes = None
+        
+        for layer_name, cache in kv_caches.items():
+            base_addr = cache.data_ptr()
+            
+            # Skip if already registered (same underlying memory)
+            if base_addr in seen_base_addresses:
+                continue
+            
+            seen_base_addresses.add(base_addr)
+            curr_size = cache.nbytes
+            
+            if tensor_size_bytes is None:
+                tensor_size_bytes = curr_size
+                self.num_blocks = cache.shape[0]
+            
+            # Register with RDMA for GPUDirect
+            mr = self.rdma.register_memory(base_addr, curr_size)
+            
+            if mr is not None:
+                self.kv_caches_base_addr.append(base_addr)
+                self.kv_caches_rkeys.append(mr.rkey)
+                
+                # Calculate block size
+                block_len = curr_size // self.num_blocks
+                
+                self.kv_cache_registry[layer_name] = KVCacheMemoryInfo(
+                    base_addr=base_addr,
+                    total_length=curr_size,
+                    lkey=mr.lkey,
+                    rkey=mr.rkey,
+                    num_blocks=self.num_blocks,
+                    block_size_bytes=block_len,
+                )
+                
+                logger.debug(
+                    "Registered layer %s: addr=0x%x, size=%d, blocks=%d, rkey=%d",
+                    layer_name, base_addr, curr_size, self.num_blocks, mr.rkey
+                )
+            else:
+                logger.warning(
+                    "Failed to register layer %s for RDMA, will use fallback",
+                    layer_name
+                )
+        
+        if tensor_size_bytes and self.num_blocks > 0:
+            self.block_len = tensor_size_bytes // self.num_blocks
+        
+        logger.info(
+            "KV cache registration complete: %d regions, %d blocks, block_len=%d",
+            len(self.kv_caches_base_addr), self.num_blocks, self.block_len
+        )
+    
+    def get_registered_memory_info(self, layer_name: str) -> KVCacheMemoryInfo | None:
+        """Get pre-registered memory info for a layer."""
+        return self.kv_cache_registry.get(layer_name)
+    
+    def rdma_write_blocks(
+        self,
+        remote_address: str,
+        layer_name: str,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        remote_base_addr: int,
+        remote_rkey: int,
+    ) -> bool:
+        """
+        RDMA write blocks using pre-registered memory.
+        
+        No per-transfer registration - uses offsets into pre-registered regions.
+        """
+        mem_info = self.get_registered_memory_info(layer_name)
+        if mem_info is None:
+            logger.warning("Layer %s not registered for RDMA", layer_name)
+            return False
+        
+        qp_info = self._qps.get(remote_address)
+        if qp_info is None:
+            logger.warning("No QP for %s", remote_address)
+            return False
+        
+        qp, _ = qp_info
+        
+        # Group contiguous blocks for efficient transfer
+        groups = self._group_contiguous_blocks(local_block_ids, remote_block_ids)
+        
+        for local_start, remote_start, count in groups:
+            local_addr = mem_info.base_addr + local_start * mem_info.block_size_bytes
+            remote_addr = remote_base_addr + remote_start * mem_info.block_size_bytes
+            length = count * mem_info.block_size_bytes
+            
+            success = self.rdma.rdma_write(
+                qp=qp,
+                local_addr=local_addr,
+                local_lkey=mem_info.lkey,
+                remote_addr=remote_addr,
+                remote_rkey=remote_rkey,
+                length=length,
+                signaled=(count == groups[-1][2]),  # Signal on last
+            )
+            
+            if not success:
+                return False
+        
+        # Wait for completion
+        completions = self.rdma.poll_completion(timeout_ms=5000)
+        return len(completions) > 0 and all(c[1] == 0 for c in completions)
+    
+    def _group_contiguous_blocks(
+        self,
+        local_ids: list[int],
+        remote_ids: list[int],
+    ) -> list[tuple[int, int, int]]:
+        """
+        Group contiguous block ranges for efficient RDMA transfers.
+        
+        Returns: List of (local_start_id, remote_start_id, count)
+        """
+        if not local_ids:
+            return []
+        
+        groups = []
+        local_start = local_ids[0]
+        remote_start = remote_ids[0]
+        count = 1
+        
+        for i in range(1, len(local_ids)):
+            # Check if contiguous in both local and remote
+            if (local_ids[i] == local_ids[i-1] + 1 and 
+                remote_ids[i] == remote_ids[i-1] + 1):
+                count += 1
+            else:
+                groups.append((local_start, remote_start, count))
+                local_start = local_ids[i]
+                remote_start = remote_ids[i]
+                count = 1
+        
+        groups.append((local_start, remote_start, count))
+        return groups
     
     def _is_same_node(self, remote_address: str) -> bool:
         if remote_address not in self.peer_same_node:

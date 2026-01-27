@@ -82,9 +82,14 @@ class P2pRdmaConnector(KVConnectorBase_V1):
     P2P RDMA Connector for KV cache transfer.
     
     This connector automatically selects the optimal transport:
-    - NVLink (via CUDA IPC) for intra-node transfers (same machine)
-    - RDMA (via UCX) for inter-node transfers (different machines)
+    - NVLink (via CUDA P2P) for intra-node transfers (same machine)
+    - RDMA (via raw ibverbs) for inter-node transfers (different machines)
     - Falls back to ZMQ-based transfer if neither is available
+    
+    Key features:
+    - One-time KV cache registration (no per-tensor registration overhead)
+    - Zero-copy GPU transfers via GPUDirect RDMA
+    - SM-free data movement using copy engines
     
     Usage:
         Configure with --kv-transfer-config='{"kv_connector": "P2pRdmaConnector", ...}'
@@ -125,6 +130,22 @@ class P2pRdmaConnector(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """
+        Register all KV cache memory regions once at initialization.
+        
+        This enables zero-copy RDMA transfers by pre-registering GPU memory
+        with the RDMA NIC. Called once when the model is loaded.
+        
+        After registration, individual tensor transfers use offsets into
+        these pre-registered regions - no per-tensor registration overhead.
+        
+        Args:
+            kv_caches: Dict mapping layer names to KV cache tensors
+        """
+        if self.p2p_rdma_engine is not None:
+            self.p2p_rdma_engine.register_kv_caches(kv_caches)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
