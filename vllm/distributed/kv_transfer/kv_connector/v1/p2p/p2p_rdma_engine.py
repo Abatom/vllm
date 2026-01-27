@@ -12,9 +12,17 @@ Key features:
 - No temporary GPU buffers - direct memory registration
 - SM-free transfers using DMA/copy engines only
 - Similar architecture to Mooncake's TransferEngine
+
+Fault Tolerance features:
+- Node crash detection and handling
+- Connection timeout with automatic retry
+- Automatic reconnection on failure
+- Scale-up and scale-down support
+- Graceful degradation on partial failures
 """
 
 import ctypes
+import enum
 import json
 import logging
 import os
@@ -24,7 +32,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import msgpack
 import torch
@@ -39,6 +47,367 @@ from vllm.utils.network_utils import get_ip
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEM_POOL_SIZE_GB = 32
+
+# ============================================================================
+# Fault Tolerance Configuration
+# ============================================================================
+
+# Connection timeout in seconds
+CONNECTION_TIMEOUT_SEC = 10.0
+# Send/receive timeout in milliseconds
+SEND_RECV_TIMEOUT_MS = 5000
+# Maximum retry attempts for connection
+MAX_RETRY_ATTEMPTS = 3
+# Retry backoff base in seconds
+RETRY_BACKOFF_BASE = 1.0
+# Heartbeat interval in seconds
+HEARTBEAT_INTERVAL_SEC = 5.0
+# Heartbeat timeout (miss count before declaring dead)
+HEARTBEAT_MISS_THRESHOLD = 3
+# Connection check interval
+CONNECTION_CHECK_INTERVAL_SEC = 10.0
+
+
+class ConnectionState(enum.Enum):
+    """Connection state for fault tolerance."""
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    FAILED = "failed"
+    REMOVED = "removed"  # For scale-down
+
+
+@dataclass
+class PeerInfo:
+    """Information about a remote peer."""
+    address: str
+    hostname: str
+    local_rank: int
+    same_node: bool
+    state: ConnectionState = ConnectionState.DISCONNECTED
+    last_heartbeat: float = 0.0
+    heartbeat_misses: int = 0
+    retry_count: int = 0
+    last_error: str = ""
+    connected_at: float = 0.0
+    rdma_info: dict | None = None
+    
+    def is_healthy(self) -> bool:
+        """Check if peer is healthy."""
+        return self.state == ConnectionState.CONNECTED
+    
+    def is_recoverable(self) -> bool:
+        """Check if connection can be recovered."""
+        return self.state in (
+            ConnectionState.DISCONNECTED,
+            ConnectionState.RECONNECTING,
+        ) and self.retry_count < MAX_RETRY_ATTEMPTS
+    
+    def mark_failed(self, error: str):
+        """Mark peer as failed."""
+        self.state = ConnectionState.FAILED
+        self.last_error = error
+        self.retry_count += 1
+    
+    def mark_connected(self):
+        """Mark peer as connected."""
+        self.state = ConnectionState.CONNECTED
+        self.connected_at = time.time()
+        self.last_heartbeat = time.time()
+        self.heartbeat_misses = 0
+        self.retry_count = 0
+    
+    def mark_disconnected(self):
+        """Mark peer as disconnected."""
+        self.state = ConnectionState.DISCONNECTED
+    
+    def mark_removed(self):
+        """Mark peer as removed (scale-down)."""
+        self.state = ConnectionState.REMOVED
+    
+    def update_heartbeat(self):
+        """Update heartbeat timestamp."""
+        self.last_heartbeat = time.time()
+        self.heartbeat_misses = 0
+    
+    def check_heartbeat(self) -> bool:
+        """Check if heartbeat is healthy. Returns False if dead."""
+        if self.state != ConnectionState.CONNECTED:
+            return True  # Not connected, don't check
+        
+        elapsed = time.time() - self.last_heartbeat
+        if elapsed > HEARTBEAT_INTERVAL_SEC:
+            self.heartbeat_misses += 1
+            if self.heartbeat_misses >= HEARTBEAT_MISS_THRESHOLD:
+                return False
+        return True
+
+
+class ConnectionManager:
+    """
+    Manages connections with fault tolerance.
+    
+    Handles:
+    - Connection lifecycle
+    - Heartbeat monitoring
+    - Automatic reconnection
+    - Scale-up/scale-down
+    """
+    
+    def __init__(
+        self,
+        local_address: str,
+        on_peer_connected: Callable[[str], None] | None = None,
+        on_peer_disconnected: Callable[[str], None] | None = None,
+        on_peer_removed: Callable[[str], None] | None = None,
+    ):
+        self.local_address = local_address
+        self.peers: dict[str, PeerInfo] = {}
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        
+        # Callbacks
+        self._on_peer_connected = on_peer_connected
+        self._on_peer_disconnected = on_peer_disconnected
+        self._on_peer_removed = on_peer_removed
+        
+        # Stats
+        self.stats = {
+            "connections_established": 0,
+            "connections_failed": 0,
+            "reconnections": 0,
+            "peers_removed": 0,
+        }
+    
+    def add_peer(self, address: str, info: dict) -> PeerInfo:
+        """Add a new peer."""
+        with self._lock:
+            if address in self.peers:
+                # Update existing peer
+                peer = self.peers[address]
+                if peer.state == ConnectionState.REMOVED:
+                    # Re-adding a removed peer (scale-up after scale-down)
+                    peer.state = ConnectionState.DISCONNECTED
+                    peer.retry_count = 0
+                return peer
+            
+            peer = PeerInfo(
+                address=address,
+                hostname=info.get("hostname", ""),
+                local_rank=info.get("local_rank", 0),
+                same_node=info.get("same_node", False),
+                rdma_info=info.get("rdma_info"),
+            )
+            self.peers[address] = peer
+            return peer
+    
+    def remove_peer(self, address: str) -> bool:
+        """Remove a peer (scale-down)."""
+        with self._lock:
+            if address not in self.peers:
+                return False
+            
+            peer = self.peers[address]
+            peer.mark_removed()
+            self.stats["peers_removed"] += 1
+            
+            if self._on_peer_removed:
+                self._on_peer_removed(address)
+            
+            logger.info("Peer removed (scale-down): %s", address)
+            return True
+    
+    def get_peer(self, address: str) -> PeerInfo | None:
+        """Get peer info."""
+        with self._lock:
+            return self.peers.get(address)
+    
+    def mark_connected(self, address: str):
+        """Mark peer as connected."""
+        with self._lock:
+            if address in self.peers:
+                peer = self.peers[address]
+                was_reconnect = peer.state == ConnectionState.RECONNECTING
+                peer.mark_connected()
+                
+                self.stats["connections_established"] += 1
+                if was_reconnect:
+                    self.stats["reconnections"] += 1
+                
+                if self._on_peer_connected:
+                    self._on_peer_connected(address)
+    
+    def mark_failed(self, address: str, error: str):
+        """Mark peer as failed."""
+        with self._lock:
+            if address in self.peers:
+                peer = self.peers[address]
+                peer.mark_failed(error)
+                self.stats["connections_failed"] += 1
+                
+                if self._on_peer_disconnected:
+                    self._on_peer_disconnected(address)
+    
+    def get_healthy_peers(self) -> list[str]:
+        """Get list of healthy peer addresses."""
+        with self._lock:
+            return [
+                addr for addr, peer in self.peers.items()
+                if peer.is_healthy()
+            ]
+    
+    def get_recoverable_peers(self) -> list[str]:
+        """Get list of peers that can be reconnected."""
+        with self._lock:
+            return [
+                addr for addr, peer in self.peers.items()
+                if peer.is_recoverable()
+            ]
+    
+    def get_all_active_peers(self) -> list[str]:
+        """Get all non-removed peers."""
+        with self._lock:
+            return [
+                addr for addr, peer in self.peers.items()
+                if peer.state != ConnectionState.REMOVED
+            ]
+    
+    def check_all_heartbeats(self) -> list[str]:
+        """Check heartbeats for all peers. Returns list of dead peers."""
+        dead_peers = []
+        with self._lock:
+            for address, peer in self.peers.items():
+                if not peer.check_heartbeat():
+                    peer.state = ConnectionState.RECONNECTING
+                    dead_peers.append(address)
+                    logger.warning(
+                        "Peer heartbeat timeout: %s (misses=%d)",
+                        address, peer.heartbeat_misses
+                    )
+        return dead_peers
+    
+    def update_heartbeat(self, address: str):
+        """Update heartbeat for a peer."""
+        with self._lock:
+            if address in self.peers:
+                self.peers[address].update_heartbeat()
+    
+    def get_stats(self) -> dict:
+        """Get connection statistics."""
+        with self._lock:
+            stats = self.stats.copy()
+            stats["total_peers"] = len(self.peers)
+            stats["healthy_peers"] = len(self.get_healthy_peers())
+            stats["failed_peers"] = sum(
+                1 for p in self.peers.values() 
+                if p.state == ConnectionState.FAILED
+            )
+            stats["removed_peers"] = sum(
+                1 for p in self.peers.values()
+                if p.state == ConnectionState.REMOVED
+            )
+            return stats
+    
+    def cleanup(self):
+        """Cleanup all peers."""
+        with self._lock:
+            self.peers.clear()
+
+
+class TransferTracker:
+    """
+    Tracks in-flight transfers with timeout handling.
+    """
+    
+    def __init__(self, timeout_sec: float = 30.0):
+        self.timeout_sec = timeout_sec
+        self._transfers: dict[str, dict] = {}  # transfer_id -> info
+        self._lock = threading.Lock()
+    
+    def start_transfer(
+        self,
+        transfer_id: str,
+        tensor_id: str,
+        remote_address: str,
+        size_bytes: int,
+    ) -> None:
+        """Record start of a transfer."""
+        with self._lock:
+            self._transfers[transfer_id] = {
+                "tensor_id": tensor_id,
+                "remote_address": remote_address,
+                "size_bytes": size_bytes,
+                "start_time": time.time(),
+                "completed": False,
+                "error": None,
+            }
+    
+    def complete_transfer(self, transfer_id: str, success: bool, error: str = ""):
+        """Mark transfer as complete."""
+        with self._lock:
+            if transfer_id in self._transfers:
+                self._transfers[transfer_id]["completed"] = True
+                if not success:
+                    self._transfers[transfer_id]["error"] = error
+    
+    def get_timed_out_transfers(self) -> list[dict]:
+        """Get list of timed out transfers."""
+        timed_out = []
+        current_time = time.time()
+        
+        with self._lock:
+            for transfer_id, info in list(self._transfers.items()):
+                if info["completed"]:
+                    continue
+                
+                elapsed = current_time - info["start_time"]
+                if elapsed > self.timeout_sec:
+                    info["transfer_id"] = transfer_id
+                    timed_out.append(info)
+        
+        return timed_out
+    
+    def cancel_transfer(self, transfer_id: str):
+        """Cancel a transfer."""
+        with self._lock:
+            if transfer_id in self._transfers:
+                self._transfers[transfer_id]["completed"] = True
+                self._transfers[transfer_id]["error"] = "cancelled"
+    
+    def cancel_transfers_for_peer(self, remote_address: str) -> list[str]:
+        """Cancel all transfers for a specific peer."""
+        cancelled = []
+        with self._lock:
+            for transfer_id, info in self._transfers.items():
+                if (info["remote_address"] == remote_address and 
+                    not info["completed"]):
+                    info["completed"] = True
+                    info["error"] = "peer_disconnected"
+                    cancelled.append(transfer_id)
+        return cancelled
+    
+    def cleanup_completed(self, max_age_sec: float = 60.0):
+        """Cleanup old completed transfers."""
+        current_time = time.time()
+        with self._lock:
+            to_remove = []
+            for transfer_id, info in self._transfers.items():
+                if info["completed"]:
+                    age = current_time - info["start_time"]
+                    if age > max_age_sec:
+                        to_remove.append(transfer_id)
+            
+            for transfer_id in to_remove:
+                del self._transfers[transfer_id]
+    
+    def get_pending_count(self) -> int:
+        """Get count of pending transfers."""
+        with self._lock:
+            return sum(
+                1 for info in self._transfers.values()
+                if not info["completed"]
+            )
 
 # ============================================================================
 # RDMA Constants from libibverbs
@@ -948,6 +1317,12 @@ class P2pRdmaEngine:
     - GPUDirect RDMA for zero-copy GPU transfers
     - NVLink P2P for intra-node
     - SM-free data movement via copy engines
+    
+    Fault Tolerance:
+    - Node crash detection
+    - Connection timeout handling
+    - Automatic reconnection
+    - Scale-up and scale-down support
     """
     
     def __init__(
@@ -988,9 +1363,12 @@ class P2pRdmaEngine:
                 raise ValueError("http_port required in kv_connector_extra_config")
             self.http_address = f"{self._hostname}:{http_port}"
         
-        # ZMQ for signaling
+        # ZMQ for signaling with timeout
         self.context = zmq.Context()
         self.router_socket = self.context.socket(zmq.ROUTER)
+        self.router_socket.setsockopt(zmq.RCVTIMEO, SEND_RECV_TIMEOUT_MS)
+        self.router_socket.setsockopt(zmq.SNDTIMEO, SEND_RECV_TIMEOUT_MS)
+        self.router_socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
         self.router_socket.bind(f"tcp://{self.zmq_address}")
         
         self.poller = zmq.Poller()
@@ -1000,6 +1378,7 @@ class P2pRdmaEngine:
         self.send_store_cv = threading.Condition()
         self.send_queue_cv = threading.Condition()
         self.recv_store_cv = threading.Condition()
+        self._shutdown_event = threading.Event()
         
         # Copy stream (uses DMA engine, not SMs)
         self.copy_stream = torch.cuda.Stream(device=self.device)
@@ -1029,10 +1408,25 @@ class P2pRdmaEngine:
         self.recv_request_id_to_tensor_ids: dict[str, set[str]] = {}
         self.send_request_id_to_tensor_ids: dict[str, set[str]] = {}
         
-        # Connections
+        # Connections (with fault tolerance)
         self.socks: dict[str, Any] = {}
         self.peer_same_node: dict[str, bool] = {}
         self.remote_qp_info: dict[str, RemoteQPInfo] = {}
+        
+        # Fault tolerance: Connection manager
+        self.conn_manager = ConnectionManager(
+            local_address=self.zmq_address,
+            on_peer_connected=self._on_peer_connected,
+            on_peer_disconnected=self._on_peer_disconnected,
+            on_peer_removed=self._on_peer_removed,
+        )
+        
+        # Fault tolerance: Transfer tracker
+        self.transfer_tracker = TransferTracker(timeout_sec=30.0)
+        
+        # Fault tolerance: Failed requests (for retry or skip)
+        self._failed_requests: set[str] = set()
+        self._pending_reconnects: set[str] = set()
         
         # Buffer
         self.buffer_size = 0
@@ -1041,6 +1435,14 @@ class P2pRdmaEngine:
         # Listener
         self._listener_thread = threading.Thread(target=self.listen_for_requests, daemon=True)
         self._listener_thread.start()
+        
+        # Fault tolerance: Health check thread
+        self._health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self._health_check_thread.start()
+        
+        # Fault tolerance: Reconnection thread
+        self._reconnect_thread = threading.Thread(target=self._reconnect_loop, daemon=True)
+        self._reconnect_thread.start()
         
         # Ping
         self._ping_thread = None
@@ -1062,6 +1464,238 @@ class P2pRdmaEngine:
             "💯P2pRdmaEngine init: rank=%d, local_rank=%d, zmq=%s, rdma=%s",
             self.rank, self.local_rank, self.zmq_address, self.rdma.is_available
         )
+    
+    # ========================================================================
+    # Fault Tolerance: Callbacks
+    # ========================================================================
+    
+    def _on_peer_connected(self, address: str):
+        """Callback when peer is connected."""
+        logger.info("✅ Peer connected: %s", address)
+    
+    def _on_peer_disconnected(self, address: str):
+        """Callback when peer is disconnected."""
+        logger.warning("❌ Peer disconnected: %s", address)
+        # Cancel pending transfers for this peer
+        cancelled = self.transfer_tracker.cancel_transfers_for_peer(address)
+        if cancelled:
+            logger.warning("Cancelled %d transfers for peer %s", len(cancelled), address)
+    
+    def _on_peer_removed(self, address: str):
+        """Callback when peer is removed (scale-down)."""
+        logger.info("🔻 Peer removed (scale-down): %s", address)
+        # Clean up connection resources
+        self._cleanup_peer_connection(address)
+    
+    # ========================================================================
+    # Fault Tolerance: Health Check
+    # ========================================================================
+    
+    def _health_check_loop(self):
+        """Background thread for health checking."""
+        while not self._shutdown_event.is_set():
+            try:
+                # Check heartbeats
+                dead_peers = self.conn_manager.check_all_heartbeats()
+                for peer_addr in dead_peers:
+                    logger.warning("Peer heartbeat failed: %s, scheduling reconnect", peer_addr)
+                    self._pending_reconnects.add(peer_addr)
+                
+                # Check for timed out transfers
+                timed_out = self.transfer_tracker.get_timed_out_transfers()
+                for transfer in timed_out:
+                    logger.warning(
+                        "Transfer timeout: tensor=%s, peer=%s",
+                        transfer["tensor_id"],
+                        transfer["remote_address"]
+                    )
+                    self.transfer_tracker.cancel_transfer(transfer["transfer_id"])
+                    self._failed_requests.add(transfer["tensor_id"].split("#")[0])
+                
+                # Cleanup old completed transfers
+                self.transfer_tracker.cleanup_completed()
+                
+            except Exception as e:
+                logger.error("Health check error: %s", e)
+            
+            # Sleep before next check
+            self._shutdown_event.wait(CONNECTION_CHECK_INTERVAL_SEC)
+    
+    # ========================================================================
+    # Fault Tolerance: Reconnection
+    # ========================================================================
+    
+    def _reconnect_loop(self):
+        """Background thread for reconnection attempts."""
+        while not self._shutdown_event.is_set():
+            try:
+                # Get peers that need reconnection
+                peers_to_reconnect = list(self._pending_reconnects)
+                
+                for peer_addr in peers_to_reconnect:
+                    peer = self.conn_manager.get_peer(peer_addr)
+                    if peer is None or peer.state == ConnectionState.REMOVED:
+                        self._pending_reconnects.discard(peer_addr)
+                        continue
+                    
+                    if not peer.is_recoverable():
+                        logger.error(
+                            "Peer not recoverable after %d attempts: %s",
+                            peer.retry_count, peer_addr
+                        )
+                        self._pending_reconnects.discard(peer_addr)
+                        continue
+                    
+                    # Attempt reconnection
+                    logger.info(
+                        "Attempting reconnection to %s (attempt %d/%d)",
+                        peer_addr, peer.retry_count + 1, MAX_RETRY_ATTEMPTS
+                    )
+                    
+                    success = self._try_reconnect(peer_addr)
+                    if success:
+                        self._pending_reconnects.discard(peer_addr)
+                        logger.info("✅ Reconnected to %s", peer_addr)
+                    else:
+                        # Exponential backoff
+                        backoff = RETRY_BACKOFF_BASE * (2 ** peer.retry_count)
+                        logger.warning(
+                            "Reconnection failed for %s, retry in %.1fs",
+                            peer_addr, backoff
+                        )
+                        time.sleep(backoff)
+                        
+            except Exception as e:
+                logger.error("Reconnect loop error: %s", e)
+            
+            self._shutdown_event.wait(1.0)  # Check every second
+    
+    def _try_reconnect(self, remote_address: str) -> bool:
+        """Attempt to reconnect to a peer."""
+        try:
+            # Close existing connection
+            self._cleanup_peer_connection(remote_address)
+            
+            # Re-establish connection
+            sock = self.context.socket(zmq.DEALER)
+            sock.setsockopt_string(zmq.IDENTITY, self.zmq_address)
+            sock.setsockopt(zmq.RCVTIMEO, SEND_RECV_TIMEOUT_MS)
+            sock.setsockopt(zmq.SNDTIMEO, SEND_RECV_TIMEOUT_MS)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(f"tcp://{remote_address}")
+            
+            # Send reconnection request
+            data = {
+                "cmd": "RECONNECT",
+                "hostname": self._local_hostname,
+                "local_rank": self.local_rank,
+            }
+            sock.send(msgpack.dumps(data))
+            
+            # Wait for response
+            response = sock.recv()
+            resp_data = msgpack.loads(response)
+            
+            if resp_data.get("status") == "ok":
+                self.socks[remote_address] = sock
+                self.conn_manager.mark_connected(remote_address)
+                return True
+            else:
+                sock.close()
+                return False
+                
+        except zmq.Again:
+            logger.warning("Reconnection timeout for %s", remote_address)
+            peer = self.conn_manager.get_peer(remote_address)
+            if peer:
+                peer.mark_failed("timeout")
+            return False
+        except Exception as e:
+            logger.warning("Reconnection failed for %s: %s", remote_address, e)
+            peer = self.conn_manager.get_peer(remote_address)
+            if peer:
+                peer.mark_failed(str(e))
+            return False
+    
+    def _cleanup_peer_connection(self, remote_address: str):
+        """Clean up connection resources for a peer."""
+        # Close ZMQ socket
+        if remote_address in self.socks:
+            try:
+                self.socks[remote_address].close()
+            except Exception:
+                pass
+            del self.socks[remote_address]
+        
+        # Clean up RDMA QP if exists
+        if remote_address in self.remote_qp_info:
+            del self.remote_qp_info[remote_address]
+        
+        # Remove from peer tracking
+        if remote_address in self.peer_same_node:
+            del self.peer_same_node[remote_address]
+    
+    # ========================================================================
+    # Fault Tolerance: Scale-down Support
+    # ========================================================================
+    
+    def remove_peer(self, remote_address: str) -> bool:
+        """
+        Remove a peer (scale-down operation).
+        
+        Args:
+            remote_address: Address of peer to remove
+            
+        Returns:
+            True if peer was removed, False if not found
+        """
+        # Cancel any pending transfers
+        cancelled = self.transfer_tracker.cancel_transfers_for_peer(remote_address)
+        if cancelled:
+            logger.info("Cancelled %d pending transfers for removed peer", len(cancelled))
+        
+        # Remove from connection manager
+        removed = self.conn_manager.remove_peer(remote_address)
+        
+        # Cleanup connection resources
+        self._cleanup_peer_connection(remote_address)
+        
+        # Remove from pending reconnects
+        self._pending_reconnects.discard(remote_address)
+        
+        return removed
+    
+    def get_active_peers(self) -> list[str]:
+        """Get list of currently active (non-removed) peers."""
+        return self.conn_manager.get_all_active_peers()
+    
+    def get_healthy_peers(self) -> list[str]:
+        """Get list of healthy (connected) peers."""
+        return self.conn_manager.get_healthy_peers()
+    
+    def get_connection_stats(self) -> dict:
+        """Get connection statistics."""
+        stats = self.conn_manager.get_stats()
+        stats["pending_transfers"] = self.transfer_tracker.get_pending_count()
+        stats["failed_requests"] = len(self._failed_requests)
+        stats["pending_reconnects"] = len(self._pending_reconnects)
+        return stats
+    
+    # ========================================================================
+    # Fault Tolerance: Error Recovery
+    # ========================================================================
+    
+    def is_request_failed(self, request_id: str) -> bool:
+        """Check if a request has failed due to connection issues."""
+        return request_id in self._failed_requests
+    
+    def clear_failed_request(self, request_id: str):
+        """Clear a request from failed set (after handling)."""
+        self._failed_requests.discard(request_id)
+    
+    def get_failed_requests(self) -> set[str]:
+        """Get set of failed request IDs."""
+        return self._failed_requests.copy()
     
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -1226,13 +1860,44 @@ class P2pRdmaEngine:
             )
         return self.peer_same_node[remote_address]
     
-    def create_connect(self, remote_address: str | None = None):
+    def create_connect(
+        self, 
+        remote_address: str | None = None,
+        retry_on_failure: bool = True,
+    ) -> Any | None:
+        """
+        Create connection to remote address with fault tolerance.
+        
+        Args:
+            remote_address: Remote peer address
+            retry_on_failure: Whether to schedule retry on failure
+            
+        Returns:
+            Socket on success, None on failure
+        """
         assert remote_address is not None
-        if remote_address not in self.socks:
+        
+        # Check if peer was removed (scale-down)
+        peer = self.conn_manager.get_peer(remote_address)
+        if peer and peer.state == ConnectionState.REMOVED:
+            logger.warning("Cannot connect to removed peer: %s", remote_address)
+            return None
+        
+        if remote_address in self.socks:
+            # Check if existing connection is healthy
+            if peer and peer.is_healthy():
+                return self.socks[remote_address]
+            else:
+                # Connection exists but unhealthy, cleanup and reconnect
+                self._cleanup_peer_connection(remote_address)
+        
+        try:
             sock = self.context.socket(zmq.DEALER)
             sock.setsockopt_string(zmq.IDENTITY, self.zmq_address)
+            sock.setsockopt(zmq.RCVTIMEO, SEND_RECV_TIMEOUT_MS)
+            sock.setsockopt(zmq.SNDTIMEO, SEND_RECV_TIMEOUT_MS)
+            sock.setsockopt(zmq.LINGER, 0)
             sock.connect(f"tcp://{remote_address}")
-            self.socks[remote_address] = sock
             
             same_node = self._is_same_node(remote_address)
             
@@ -1260,9 +1925,18 @@ class P2pRdmaEngine:
             }
             sock.send(msgpack.dumps(data))
             
-            # Wait for response with remote RDMA info
+            # Wait for response with timeout
             response = sock.recv()
             resp_data = msgpack.loads(response)
+            
+            # Register peer with connection manager
+            self.conn_manager.add_peer(remote_address, {
+                "hostname": self._local_hostname,
+                "local_rank": self.local_rank,
+                "same_node": same_node,
+                "rdma_info": resp_data.get("rdma_info"),
+            })
+            
             if resp_data.get("rdma_info") and not same_node:
                 ri = resp_data["rdma_info"]
                 remote_info = RemoteQPInfo(
@@ -1279,10 +1953,28 @@ class P2pRdmaEngine:
                     self.rdma.modify_qp_to_rtr(qp, remote_info)
                     self.rdma.modify_qp_to_rts(qp)
             
+            self.socks[remote_address] = sock
+            self.conn_manager.mark_connected(remote_address)
+            
             logger.info("🤝Connected: %s👉%s, same_node=%s", 
                        self.zmq_address, remote_address, same_node)
-        
-        return self.socks[remote_address]
+            
+            return sock
+            
+        except zmq.Again:
+            # Timeout
+            logger.warning("Connection timeout to %s", remote_address)
+            self.conn_manager.mark_failed(remote_address, "timeout")
+            if retry_on_failure:
+                self._pending_reconnects.add(remote_address)
+            return None
+            
+        except Exception as e:
+            logger.error("Connection failed to %s: %s", remote_address, e)
+            self.conn_manager.mark_failed(remote_address, str(e))
+            if retry_on_failure:
+                self._pending_reconnects.add(remote_address)
+            return None
     
     @property
     def _qps(self):
@@ -1379,110 +2071,182 @@ class P2pRdmaEngine:
         return tensor
     
     def listen_for_requests(self):
-        while True:
-            socks = dict(self.poller.poll())
-            if self.router_socket not in socks:
-                continue
-            
-            remote_address, message = self.router_socket.recv_multipart()
-            data = msgpack.loads(message)
-            
-            if data["cmd"] == "NEW":
-                same_node = data.get("same_node", False)
-                self.peer_same_node[remote_address.decode()] = same_node
+        """Listen for incoming requests with fault tolerance."""
+        while not self._shutdown_event.is_set():
+            try:
+                # Poll with timeout to allow checking shutdown
+                socks = dict(self.poller.poll(timeout=1000))
+                if self.router_socket not in socks:
+                    continue
                 
-                # Setup RDMA QP if remote sent RDMA info
-                rdma_info = data.get("rdma_info")
-                response_rdma = None
-                if rdma_info and not same_node and self.rdma.is_available:
-                    remote_info = RemoteQPInfo(
-                        qp_num=rdma_info["qp_num"],
-                        lid=rdma_info["lid"],
-                        psn=rdma_info["psn"],
-                        gid=rdma_info["gid"],
-                    )
-                    self.remote_qp_info[remote_address.decode()] = remote_info
-                    
-                    # Create our QP
-                    qp_result = self.rdma.create_qp(remote_address.decode())
-                    if qp_result:
-                        qp, qp_num = qp_result
-                        self.rdma.modify_qp_to_init(qp)
-                        self.rdma.modify_qp_to_rtr(qp, remote_info)
-                        self.rdma.modify_qp_to_rts(qp)
-                        
-                        local_info = self.rdma.get_local_info()
-                        response_rdma = {
-                            "qp_num": qp_num,
-                            "lid": local_info.lid,
-                            "psn": 0,
-                            "gid": local_info.gid,
-                        }
-                
-                response = {"rdma_info": response_rdma}
-                self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
-                
-                logger.info("🤝New: %s👈%s, same_node=%s, rdma=%s",
-                           self.zmq_address, remote_address.decode(), same_node,
-                           response_rdma is not None)
-                
-            elif data["cmd"] == "PUT":
-                tensor_id = data["tensor_id"]
+                remote_address, message = self.router_socket.recv_multipart()
+                remote_addr_str = remote_address.decode()
                 
                 try:
-                    tensor = torch.empty(
-                        data["shape"],
-                        dtype=getattr(torch, data["dtype"]),
-                        device=self.device,
-                    )
+                    data = msgpack.loads(message)
+                except Exception as e:
+                    logger.warning("Failed to decode message from %s: %s", remote_addr_str, e)
+                    continue
+                
+                # Update heartbeat for known peers
+                self.conn_manager.update_heartbeat(remote_addr_str)
+                
+                if data["cmd"] == "NEW":
+                    same_node = data.get("same_node", False)
+                    self.peer_same_node[remote_addr_str] = same_node
                     
-                    self.router_socket.send_multipart([remote_address, b"0"])
-                    _, tensor_data = self.router_socket.recv_multipart()
+                    # Register peer
+                    self.conn_manager.add_peer(remote_addr_str, {
+                        "hostname": data.get("hostname", ""),
+                        "local_rank": data.get("local_rank", 0),
+                        "same_node": same_node,
+                        "rdma_info": data.get("rdma_info"),
+                    })
                     
-                    with torch.cuda.stream(self.copy_stream):
-                        cpu_tensor = torch.frombuffer(tensor_data, dtype=tensor.dtype).reshape(tensor.shape)
-                        tensor.copy_(cpu_tensor, non_blocking=True)
-                    self.copy_stream.synchronize()
-                    
-                    tensor_size = tensor.element_size() * tensor.numel()
-                    if self.buffer_size + tensor_size > self.buffer_size_threshold:
-                        addr = self.pool.store_tensor(tensor)
-                        tensor = (addr, tensor.dtype, tensor.shape)
-                    else:
-                        self.buffer_size += tensor_size
+                    # Setup RDMA QP if remote sent RDMA info
+                    rdma_info = data.get("rdma_info")
+                    response_rdma = None
+                    if rdma_info and not same_node and self.rdma.is_available:
+                        remote_info = RemoteQPInfo(
+                            qp_num=rdma_info["qp_num"],
+                            lid=rdma_info["lid"],
+                            psn=rdma_info["psn"],
+                            gid=rdma_info["gid"],
+                        )
+                        self.remote_qp_info[remote_addr_str] = remote_info
                         
-                except torch.cuda.OutOfMemoryError:
-                    self.router_socket.send_multipart([remote_address, b"1"])
-                    tensor = None
-                
-                with self.recv_store_cv:
-                    self.recv_store[tensor_id] = tensor
-                    self.have_received_tensor_id(tensor_id)
-                    self.recv_store_cv.notify()
+                        # Create our QP
+                        qp_result = self.rdma.create_qp(remote_addr_str)
+                        if qp_result:
+                            qp, qp_num = qp_result
+                            self.rdma.modify_qp_to_init(qp)
+                            self.rdma.modify_qp_to_rtr(qp, remote_info)
+                            self.rdma.modify_qp_to_rts(qp)
+                            
+                            local_info = self.rdma.get_local_info()
+                            response_rdma = {
+                                "qp_num": qp_num,
+                                "lid": local_info.lid,
+                                "psn": 0,
+                                "gid": local_info.gid,
+                            }
                     
-            elif data["cmd"] == "GET":
-                tensor_id = data["tensor_id"]
+                    response = {"rdma_info": response_rdma}
+                    self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
+                    self.conn_manager.mark_connected(remote_addr_str)
+                    
+                    logger.info("🤝New: %s👈%s, same_node=%s, rdma=%s",
+                               self.zmq_address, remote_addr_str, same_node,
+                               response_rdma is not None)
                 
-                with self.send_store_cv:
-                    tensor = self.send_store.pop(tensor_id, None)
-                    if tensor is not None:
-                        self.send_store[tensor_id] = tensor  # LRU
-                        self.have_sent_tensor_id(tensor_id)
-                        response = {
-                            "ret": 0,
-                            "shape": list(tensor.shape),
-                            "dtype": str(tensor.dtype).replace("torch.", ""),
-                        }
+                elif data["cmd"] == "RECONNECT":
+                    # Handle reconnection request
+                    logger.info("🔄 Reconnect request from %s", remote_addr_str)
+                    
+                    # Update peer state
+                    peer = self.conn_manager.get_peer(remote_addr_str)
+                    if peer and peer.state == ConnectionState.REMOVED:
+                        # Peer was removed (scale-down), reject reconnection
+                        response = {"status": "rejected", "reason": "peer_removed"}
                     else:
-                        response = {"ret": 1}
+                        # Accept reconnection
+                        self.conn_manager.add_peer(remote_addr_str, {
+                            "hostname": data.get("hostname", ""),
+                            "local_rank": data.get("local_rank", 0),
+                            "same_node": self.peer_same_node.get(remote_addr_str, False),
+                        })
+                        self.conn_manager.mark_connected(remote_addr_str)
+                        response = {"status": "ok"}
+                    
+                    self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
                 
-                self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
+                elif data["cmd"] == "HEARTBEAT":
+                    # Heartbeat ping
+                    response = {"status": "ok", "timestamp": time.time()}
+                    self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
                 
-                if response["ret"] == 0:
-                    with torch.cuda.stream(self.copy_stream):
-                        tensor_bytes = tensor.to(self.device).cpu().numpy().tobytes()
-                    self.copy_stream.synchronize()
-                    self.router_socket.send_multipart([remote_address, tensor_bytes])
+                elif data["cmd"] == "DISCONNECT":
+                    # Graceful disconnect (scale-down notification)
+                    logger.info("📤 Disconnect notification from %s", remote_addr_str)
+                    self.conn_manager.remove_peer(remote_addr_str)
+                    response = {"status": "ok"}
+                    self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
+                
+                elif data["cmd"] == "PUT":
+                    tensor_id = data["tensor_id"]
+                    
+                    try:
+                        tensor = torch.empty(
+                            data["shape"],
+                            dtype=getattr(torch, data["dtype"]),
+                            device=self.device,
+                        )
+                        
+                        self.router_socket.send_multipart([remote_address, b"0"])
+                        _, tensor_data = self.router_socket.recv_multipart()
+                        
+                        with torch.cuda.stream(self.copy_stream):
+                            cpu_tensor = torch.frombuffer(tensor_data, dtype=tensor.dtype).reshape(tensor.shape)
+                            tensor.copy_(cpu_tensor, non_blocking=True)
+                        self.copy_stream.synchronize()
+                        
+                        tensor_size = tensor.element_size() * tensor.numel()
+                        if self.buffer_size + tensor_size > self.buffer_size_threshold:
+                            addr = self.pool.store_tensor(tensor)
+                            tensor = (addr, tensor.dtype, tensor.shape)
+                        else:
+                            self.buffer_size += tensor_size
+                            
+                    except zmq.Again:
+                        # Timeout receiving tensor data
+                        logger.warning("Timeout receiving tensor data from %s", remote_addr_str)
+                        tensor = None
+                        self._failed_requests.add(tensor_id.split("#")[0])
+                            
+                    except torch.cuda.OutOfMemoryError:
+                        self.router_socket.send_multipart([remote_address, b"1"])
+                        tensor = None
+                    
+                    with self.recv_store_cv:
+                        self.recv_store[tensor_id] = tensor
+                        self.have_received_tensor_id(tensor_id)
+                        self.recv_store_cv.notify()
+                        
+                elif data["cmd"] == "GET":
+                    tensor_id = data["tensor_id"]
+                    
+                    with self.send_store_cv:
+                        tensor = self.send_store.pop(tensor_id, None)
+                        if tensor is not None:
+                            self.send_store[tensor_id] = tensor  # LRU
+                            self.have_sent_tensor_id(tensor_id)
+                            response = {
+                                "ret": 0,
+                                "shape": list(tensor.shape),
+                                "dtype": str(tensor.dtype).replace("torch.", ""),
+                            }
+                        else:
+                            response = {"ret": 1}
+                    
+                    self.router_socket.send_multipart([remote_address, msgpack.dumps(response)])
+                    
+                    if response["ret"] == 0:
+                        try:
+                            with torch.cuda.stream(self.copy_stream):
+                                tensor_bytes = tensor.to(self.device).cpu().numpy().tobytes()
+                            self.copy_stream.synchronize()
+                            self.router_socket.send_multipart([remote_address, tensor_bytes])
+                        except zmq.Again:
+                            logger.warning("Timeout sending tensor to %s", remote_addr_str)
+                
+                else:
+                    logger.warning("Unknown command from %s: %s", remote_addr_str, data.get("cmd"))
+                    
+            except zmq.Again:
+                # Timeout on recv, continue
+                continue
+            except Exception as e:
+                logger.error("Error processing request: %s", e)
     
     def have_sent_tensor_id(self, tensor_id: str):
         request_id = tensor_id.split("#")[0]
@@ -1578,16 +2342,89 @@ class P2pRdmaEngine:
             time.sleep(3)
     
     def close(self) -> None:
-        self._listener_thread.join(timeout=1)
-        if self.send_type == "PUT_ASYNC":
-            self._send_thread.join(timeout=1)
-        if self._ping_thread is not None:
-            self._ping_thread.join(timeout=1)
+        """Close engine with graceful shutdown."""
+        logger.info("Shutting down P2pRdmaEngine...")
         
+        # Signal all threads to stop
+        self._shutdown_event.set()
+        
+        # Notify all peers of graceful shutdown
+        self._notify_peers_shutdown()
+        
+        # Wait for threads
+        if hasattr(self, '_listener_thread'):
+            self._listener_thread.join(timeout=2)
+        if hasattr(self, '_health_check_thread'):
+            self._health_check_thread.join(timeout=2)
+        if hasattr(self, '_reconnect_thread'):
+            self._reconnect_thread.join(timeout=2)
+        if self.send_type == "PUT_ASYNC" and hasattr(self, '_send_thread'):
+            self._send_thread.join(timeout=2)
+        if self._ping_thread is not None:
+            self._ping_thread.join(timeout=2)
+        
+        # Cleanup connection manager
+        if hasattr(self, 'conn_manager'):
+            self.conn_manager.cleanup()
+        
+        # Cleanup transport layers
         self.rdma.close()
         self.nvlink.close()
         
+        # Close all sockets
         for sock in self.socks.values():
-            sock.close()
-        self.router_socket.close()
-        self.context.term()
+            try:
+                sock.close()
+            except Exception:
+                pass
+        self.socks.clear()
+        
+        try:
+            self.router_socket.close()
+        except Exception:
+            pass
+        
+        try:
+            self.context.term()
+        except Exception:
+            pass
+        
+        logger.info("P2pRdmaEngine shutdown complete")
+    
+    def _notify_peers_shutdown(self):
+        """Notify all connected peers of graceful shutdown."""
+        for address, sock in list(self.socks.items()):
+            try:
+                data = {"cmd": "DISCONNECT"}
+                sock.send(msgpack.dumps(data), zmq.NOBLOCK)
+            except Exception:
+                pass  # Best effort
+    
+    def graceful_disconnect(self, remote_address: str) -> bool:
+        """
+        Gracefully disconnect from a peer (for scale-down).
+        
+        Sends disconnect notification and cleans up resources.
+        """
+        if remote_address not in self.socks:
+            return False
+        
+        try:
+            sock = self.socks[remote_address]
+            data = {"cmd": "DISCONNECT"}
+            sock.send(msgpack.dumps(data))
+            
+            # Wait for acknowledgment
+            try:
+                sock.setsockopt(zmq.RCVTIMEO, 1000)
+                response = sock.recv()
+                resp_data = msgpack.loads(response)
+                logger.info("Disconnect acknowledged by %s", remote_address)
+            except zmq.Again:
+                logger.warning("No disconnect ack from %s", remote_address)
+        except Exception as e:
+            logger.warning("Error during graceful disconnect: %s", e)
+        
+        # Cleanup
+        self.remove_peer(remote_address)
+        return True
